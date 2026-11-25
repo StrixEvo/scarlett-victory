@@ -363,6 +363,10 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
+/// picked by index that runs inside it (`heap_textures`), and the buffer
+/// slots the pass over buffer views looked at; since the last frame line.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -384,6 +388,20 @@ pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), 
 /// Uploads of textures already on the card made while it had no room for
 /// new ones, since the start.
 pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a pass over the textures picked by index on a full card holds
+/// back the slots that need a new host copy (`VICTORY_FULL_CARD_PASS=0`:
+/// no, as before: they stay due, each pass looks at the same ones again
+/// and stops at the 257th). Held back, such a slot is looked at again
+/// after about four seconds or as soon as the card has room, and the pass
+/// goes on to the slots behind it: the ones whose host copy exists and
+/// only wants bringing up to date, and the ones whose memory went (letting
+/// their host copies go is what makes room). What is uploaded while the
+/// card has room is the same either way.
+fn full_card_pass() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FULL_CARD_PASS").is_none_or(|v| v != "0"))
+}
 
 /// Whether a texture that has its host copy is still brought up to date
 /// while the card has no room for new ones (`VICTORY_REUPLOAD_WHEN_FULL=0`:
@@ -753,7 +771,11 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        // Set between the parts of a large dispatch (`group_base`).
+        if kind == USER_GROUP_BASE {
+            return 0;
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -1401,6 +1423,7 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1479,7 +1502,9 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
+        HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1587,7 +1612,10 @@ impl State {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms().max(1);
         let next = NEXT.load(Ordering::Relaxed);
-        let due_now = if next == 0 { !room } else { now >= next };
+        // (With levels on demand the card may never be without room: the
+        // lines then start with the first texture made that way.)
+        let by_level = crate::tiles::STATS[4].load(Ordering::Relaxed) > 0;
+        let due_now = if next == 0 { !room || by_level } else { now >= next };
         if !due_now || NEXT.compare_exchange(next, now + 5000, Ordering::Relaxed, Ordering::Relaxed).is_err() {
             return;
         }
@@ -1681,15 +1709,34 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let room = crate::resource::room();
+        let mut room = crate::resource::room();
+        // Bytes uploaded by this pass since the card was last asked
+        // whether it has room: asked again every 32 MiB (a pass may upload
+        // 192 MB and more, and one asking a pass let the queue run some
+        // 400 MB past its line while the world loaded: run 193).
+        let mut since_asked = 0u64;
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        // Room again: the slots held back while the card was full are due
+        // now (`full_card_pass`).
+        if room {
+            host.texture_slots_room(frame);
+        }
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        // Levels on demand: the slots of textures whose first level with
+        // memory changed since the last pass are made again from it.
+        host.texture_views_remade();
+        // And with room, the textures whose upload left a held level
+        // without the card's memory are uploaded again.
+        if room {
+            host.texture_slots_waiting(frame);
+        }
+        host.texture_sweep(heap, frame);
         let (due, census) = host.texture_slots_due(frame, 4096);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
@@ -1794,7 +1841,9 @@ impl State {
             let mut partly = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                // Of the mips the view shows: what lies behind them is
+                // another texture's.
+                let len = crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
@@ -1844,7 +1893,15 @@ impl State {
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
                     refused += 1;
-                    if refused > 256 {
+                    if full_card_pass() {
+                        // Held back for the frames of about four seconds
+                        // (`most`), or until the card has room; the pass
+                        // goes on, within a count that bounds one pass.
+                        host.texture_slot_held(index, write, frame + most);
+                        if refused > 1024 {
+                            break;
+                        }
+                    } else if refused > 256 {
                         break;
                     }
                     continue;
@@ -1877,6 +1934,9 @@ impl State {
             // through a table: they upload it, and check it at every
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
+            if tabled {
+                crate::texture::upload_again(resource);
+            }
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
             }
@@ -1924,6 +1984,11 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
+            since_asked += bytes;
+            if room && since_asked >= 32 << 20 {
+                since_asked = 0;
+                room = crate::resource::room();
+            }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             match memory {
@@ -2021,8 +2086,24 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        match group_base(p) {
+            Some((param, dword)) if x > crate::indirect::PART => {
+                // More than the host runs in one dimension: in parts.
+                // SAFETY: an open list with everything set; the parameter
+                // and dword are the pipeline's.
+                unsafe {
+                    let mut base = 0;
+                    while base < x {
+                        list.list.SetComputeRoot32BitConstant(param, base, dword);
+                        list.list.Dispatch((x - base).min(crate::indirect::PART), y, z);
+                        base += crate::indirect::PART;
+                    }
+                    list.list.SetComputeRoot32BitConstant(param, 0, dword);
+                }
+            }
+            // SAFETY: an open list with everything set.
+            _ => unsafe { list.list.Dispatch(x, y, z) },
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2902,6 +2983,13 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
+        // A dispatch that may have more groups than the host runs in one
+        // dimension, by a program that takes the number of its first group.
+        let parts = if kind == DISPATCH && max == 1 && count.is_none() {
+            group_base(p).zip(host_signature(DISPATCH, crate::indirect::PART_BYTES as u32))
+        } else {
+            None
+        };
         let windowed = windows()
             && kind != DISPATCH
             && max == 1
@@ -2953,7 +3041,9 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                let bounded = if parts.is_some() {
+                    crate::indirect::bound_split(list, (&args.buffer, offset))
+                } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
@@ -2998,14 +3088,23 @@ impl State {
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+            if let Some(((param, dword), signature)) = &parts {
+                for part in 0..crate::indirect::SPLIT {
+                    list.list.SetComputeRoot32BitConstant(*param, part * crate::indirect::PART, *dword);
+                    let at = u64::from(part) * crate::indirect::PART_BYTES;
+                    list.list.ExecuteIndirect(signature, 1, &bounded, at, None, 0);
+                }
+                list.list.SetComputeRoot32BitConstant(*param, 0, *dword);
+            } else {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                )
+            }
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
@@ -3018,6 +3117,17 @@ impl State {
         }
         true
     }
+}
+
+/// Where a compute pipeline's program takes the number of its first thread
+/// group (`victory_shader::emit::USER_GROUP_BASE`): the root parameter of
+/// its user data and the dword in it.
+fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    let stage = p.stages.first().filter(|_| p.compute)?;
+    let (param, _) = stage.user_data?;
+    let base = RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+    let word = stage.translated().host.user_data.iter().find(|u| u.root == base)?;
+    Some((param, word.index))
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -3129,7 +3239,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                // Of a texture the title placed, the mips the view shows.
+                let first = match (&placed, view) {
+                    (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
+                    _ => 0,
+                };
+                crate::texture::upload_from(list, *resource as This, t, first);
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);
@@ -3258,13 +3373,16 @@ fn view_state(view: Option<&View>) -> String {
                     memory_state(address, crate::resource::placed_bytes(r).unwrap_or(0))
                 ),
             };
-            format!("placed texture view_format={} {state}", d[0])
+            // (Last, so that readers of the older lines still find
+            // theirs: the level the view starts at, and how many it shows.)
+            format!("placed texture view_format={} {state} view_levels={}+{}", d[0], d[4], d[5] as i32)
         }
         Some(View::Shader(r, d)) if crate::resource::texture_memory(*r as This).is_some() => {
             format!(
-                "texture object {r:#x} view_format={} {}",
+                "texture object {r:#x} view_format={} {} view_levels={}",
                 d.as_ref().map_or(0, |d| d[0]),
-                texture_state(*r as This)
+                texture_state(*r as This),
+                d.as_ref().map_or("all".to_owned(), |d| format!("{}+{}", d[4], d[5] as i32))
             )
         }
         Some(v) => format!("{v:?}").chars().take(80).collect(),

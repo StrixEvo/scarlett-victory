@@ -308,6 +308,10 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
             box_nodes.push((s.add(nodes::box16(ids, boxes), 16), 4));
         }
     }
+    // The extremes of a 16-bit bound (the reference's own test of them),
+    // with its rays alone.
+    let (children, halves) = nodes::EXTREMES;
+    let extreme = s.add(nodes::box16_of_halves(children, halves), 16);
     // Triangles: one of the reference's tests, a pair as the title's
     // builder stores it, all four triangles of a full node with turned
     // ids, random ones.
@@ -381,6 +385,19 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
             cases.push(Some((n, kind, Ray::new(origin, direction, extent))));
         }
     }
+    // The extremes of a 16-bit bound, at the reference's test rays: all of
+    // space, a box of negative infinity alone, one NaN on y, the smallest
+    // ones.
+    for ray in nodes::extreme_rays() {
+        cases.push(Some((extreme, 4, ray)));
+    }
+    // A direction component that is not a number. The reference holds the
+    // inverse at -f32::MAX, so y does not limit the ray; the card must agree.
+    cases.push(Some((
+        box_nodes[0].0,
+        5,
+        Ray::new([-5.0, 0.0, 0.0], [1.0, f32::NAN, 0.0], 100.0),
+    )));
     // Rays at every triangle: aimed inside, at an edge, at a vertex, past
     // it, from both sides, along each axis.
     for &(n, kind) in &triangle_nodes {
