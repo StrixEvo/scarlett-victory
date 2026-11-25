@@ -197,7 +197,7 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
         // A box whose minimum x is NaN is switched off.
-        if !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
+        if children[n] != NONE && !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
         }
@@ -474,6 +474,16 @@ pub(crate) mod tests {
         );
         let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
         // Child 1 is hit but is not there: its pointer is what "none" is.
+        assert_eq!(intersect(&node, 5, &ray, true), [8, NONE, NONE, NONE]);
+    }
+    #[test]
+    fn an_absent_child_cannot_sort_ahead_of_a_valid_child() {
+        let node = box32(
+            [NONE, 8, NONE, NONE],
+            [UNIT, moved(UNIT, [4.0, 0.0, 0.0]), OFF, OFF],
+        );
+        let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 10.0);
+
         assert_eq!(intersect(&node, 5, &ray, true), [8, NONE, NONE, NONE]);
     }
 
