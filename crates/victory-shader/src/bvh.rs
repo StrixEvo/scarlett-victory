@@ -333,6 +333,19 @@ pub(crate) mod tests {
         w
     }
 
+    /// A 16-bit box node from its bounds as stored, half by half.
+    pub(crate) fn box16_of_halves(children: [u32; 4], halves: [[u16; 6]; 4]) -> [u32; 28] {
+        let mut w = [0u32; 28];
+        w[..4].copy_from_slice(&children);
+        for (b, hx) in halves.iter().enumerate() {
+            for (k, h) in hx.iter().enumerate() {
+                let n = 6 * b + k;
+                w[4 + n / 2] |= u32::from(*h) << (16 * (n % 2));
+            }
+        }
+        w
+    }
+
     /// A triangle node: up to five vertices, and the dword at byte 60.
     pub(crate) fn triangles(vertices: &[[f32; 3]], id: u32) -> [u32; 28] {
         let mut w = [0u32; 28];
@@ -377,6 +390,7 @@ pub(crate) mod tests {
         assert_eq!(half_to_f32(0x3c00), 1.0);
         assert_eq!(half_to_f32(0xc000), -2.0);
         assert_eq!(half_to_f32(0x7c00), f32::INFINITY);
+        assert_eq!(half_to_f32(0xfc00), f32::NEG_INFINITY);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
         assert_eq!(half_to_f32(0x03ff), 1023.0 * 2f32.powi(-24));
         assert_eq!(half_to_f32(0x7bff), 65504.0);
@@ -518,6 +532,85 @@ pub(crate) mod tests {
         );
     }
 
+    /// A 16-bit box node whose bounds are what a half holds at its
+    /// extremes: all of space, a box of negative infinity alone (never
+    /// entered), a box that is not a number on y only, and the smallest
+    /// boxes there are. (The card tests run it too.)
+    pub(crate) const EXTREMES: ([u32; 4], [[u16; 6]; 4]) = (
+        [0x504, 0x604, 0x704, 0x804],
+        [
+            [0xfc00, 0xfc00, 0xfc00, 0x7c00, 0x7c00, 0x7c00],
+            [0xfc00, 0xfc00, 0xfc00, 0xfc00, 0xfc00, 0xfc00],
+            [0xbc00, 0x7e00, 0xbc00, 0x3c00, 0x7e00, 0x3c00],
+            [0x0001, 0x0001, 0x0001, 0x03ff, 0x03ff, 0x03ff],
+        ],
+    );
+
+    /// The rays of [`EXTREMES`]: from the origin, along +x and along each
+    /// diagonal.
+    pub(crate) fn extreme_rays() -> [Ray; 3] {
+        [
+            Ray::new([0.0; 3], [1.0, 0.0, 0.0], 1000.0),
+            Ray::new([0.0; 3], [1.0, 1.0, 1.0], 100.0),
+            Ray::new([0.0; 3], [-1.0, -1.0, -1.0], 100.0),
+        ]
+    }
+
+    #[test]
+    fn half_boxes_at_the_extremes_test_like_their_widened_bounds() {
+        let (children, halves) = EXTREMES;
+        let node = box16_of_halves(children, halves);
+        let wide = boxes16(&node);
+        assert_eq!(
+            wide[0],
+            [
+                -f32::INFINITY,
+                -f32::INFINITY,
+                -f32::INFINITY,
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::INFINITY
+            ]
+        );
+        assert_eq!(wide[1], [-f32::INFINITY; 6]);
+        assert!(wide[2][1].is_nan() && wide[2][4].is_nan());
+        assert_eq!(
+            [wide[2][0], wide[2][2], wide[2][3], wide[2][5]],
+            [-1.0, -1.0, 1.0, 1.0]
+        );
+        assert_eq!(
+            wide[3],
+            [
+                2f32.powi(-24),
+                2f32.powi(-24),
+                2f32.powi(-24),
+                1023.0 * 2f32.powi(-24),
+                1023.0 * 2f32.powi(-24),
+                1023.0 * 2f32.powi(-24)
+            ]
+        );
+        let [x, diagonal, back] = extreme_rays();
+        // Along +x: all of space at once, then the box NaN on y, entered
+        // at -1. The box of negative infinity is never entered, and the
+        // smallest one is entered far past the ray's extent (its y and z
+        // slabs, a direction of 0: bounds of 2^-24 times 2^128).
+        assert_eq!(intersect(&node, 4, &x, true), [0x504, 0x704, NONE, NONE]);
+        // Along the diagonal the smallest one is entered at 2^-24.
+        assert_eq!(
+            intersect(&node, 4, &diagonal, true),
+            [0x504, 0x704, 0x804, NONE]
+        );
+        // Backwards: all of space and the box NaN on y again.
+        assert_eq!(intersect(&node, 4, &back, true), [0x504, 0x704, NONE, NONE]);
+        // The same as through a 32-bit node of the widened bounds.
+        for ray in [&x, &diagonal, &back] {
+            assert_eq!(
+                intersect(&node, 4, ray, true),
+                intersect(&box32(children, wide), 5, ray, true)
+            );
+        }
+    }
+
     /// The hit a result describes: distance, I, J, front face.
     fn hit(r: [u32; 4]) -> Option<(f32, f32, f32, bool)> {
         let [t, det, i, j] = r.map(f32::from_bits);
@@ -597,6 +690,46 @@ pub(crate) mod tests {
                     // Aim at (ox, oy, 4).
                     let s = 4.0 / d[2];
                     let ray = Ray::new([ox - d[0] * s, oy - d[1] * s, 0.0], d, 100.0);
+                    let a = hit(intersect(&first, 0, &ray, true));
+                    let b = hit(intersect(&second, 0, &ray, true));
+                    assert!(
+                        a.is_some() || b.is_some(),
+                        "a hole at {ox} {oy} along {d:?}"
+                    );
+                    for h in [a, b].into_iter().flatten() {
+                        assert!((h.0 - s).abs() < 1e-5 && h.3, "{h:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_quad_far_from_the_origin_leaves_no_hole_along_its_edge() {
+        // The same quad a hundredth the size, about 11,000 units from the
+        // origin. A 32-bit float has steps of 0.0002 to 0.001 there, so
+        // the quad is some twenty to eighty steps wide and its corners are
+        // not exact values.
+        let at = [3700.0, -5200.0, 9100.0];
+        let v = |x: f32, y: f32| std::array::from_fn(|a| at[a] + [x, y, 0.0][a]);
+        let quad = [
+            v(-0.01, -0.01),
+            v(-0.01, 0.01),
+            v(0.01, 0.01),
+            v(0.01, -0.01),
+        ];
+        let first = triangles(&[quad[0], quad[1], quad[2]], 9);
+        let second = triangles(&[quad[0], quad[2], quad[3]], 9);
+        // A fan of rays crossing the diagonal, some on it, each started
+        // one unit short of the quad.
+        for n in -8..=8 {
+            let x = n as f32 / 1024.0;
+            for (ox, oy) in [(x, x), (x, x + 1.0 / 4096.0), (x + 1.0 / 4096.0, x)] {
+                for d in [[0.0, 0.0, 1.0], [0.125, -0.0625, 1.0], [0.25, 0.5, 2.0]] {
+                    // Aim at (ox, oy) over the quad.
+                    let s = 1.0 / d[2];
+                    let origin = [at[0] + ox - d[0] * s, at[1] + oy - d[1] * s, at[2] - 1.0];
+                    let ray = Ray::new(origin, d, 100.0);
                     let a = hit(intersect(&first, 0, &ray, true));
                     let b = hit(intersect(&second, 0, &ray, true));
                     assert!(
