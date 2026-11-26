@@ -26,26 +26,49 @@ Every result here comes from one PC:
 | CPU | AMD Ryzen 5 5600X (6 cores) |
 | GPU | AMD Radeon RX 6700 XT, 12 GB (driver 32.0.21030.2001) |
 | RAM | 32 GB |
-| Console profile | Xbox Series X (the default); Series S not tested yet |
+| Console profile | Xbox Series X, with the Series S render path (`VICTORY_RENDER_S=1`, below) |
 
 ## Status (2026-11-26)
 
-**Not playable yet.**
+**Not playable yet**, but the opening plays through to the prison at up to
+about 6 fps.
 
 | Stage | State on the test machine |
 |-------|---------------------------|
 | Boot, menus, start screen | works, 30 fps |
-| Opening cutscene | plays; characters, boat, water and sky are drawn |
-| The world (first mission) | renders at about 2 to 6 fps (median about 3) |
-| The boat | **sinks as soon as the cutscene hands over to play** (see Findings) |
-| Faces, some foliage and bridges | sometimes without their texture (black; magenta with `VICTORY_NULL_MAGENTA=1`) |
-| Ray-traced light | does not run (the structure builder is off by default) |
-| Stability | runs of 5 to 30 minutes end normally; device losses were seen in older runs, none in the latest |
+| Opening cutscenes | play; characters, boat, water and sky are drawn |
+| The prison (first walk-around) | **3.8 to 5.7 fps** with the Series S render path and the AMD FSR DLL (run38); 3.2 to 3.6 fps at 4K (run32) |
+| Indoor light | **missing**: anything the sun does not reach is near-black, because the ray-traced indirect light does not run (the structure builder is off by default); `VICTORY_BVH_BUILDER=1` is being tested |
+| The boat | the cause of the sinking is found (see Findings); the fix (`VICTORY_TEXTURE_BACK=1`) is in, not yet checked in game |
+| Faces, some foliage and bridges | sometimes without their texture: the 12 GB card runs out of texture room |
+| Stability | runs of 5 to 30 minutes end normally; no device loss in the latest runs |
+
+### Recommended run
+
+```powershell
+$env:VICTORY_TEXTURE_BACK = '1'      # water maps back to the CPU (boat)
+$env:VICTORY_HEAP_PASS_MARKED = '1'  # heap pass looks only at changed slots
+$env:VICTORY_RENDER_S = '1'          # Series S render path: 3D at 1080p
+$env:VICTORY_FSR_DLL = '<path>\amd_fidelityfx_upscaler_dx12.dll'
+target\release\victory.exe run <game dir>\<the title's exe> --execute
+```
+
+`amd_fidelityfx_upscaler_dx12.dll` is AMD's signed PC upscaler, from
+`Kits/FidelityFX/signedbin` of the
+[FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+(v2.4.0 was used); it is not in this repository. `VICTORY_RENDER_S` needs it:
+the title's own Xbox upscaler has 10 compute shaders that do not translate, so
+without the DLL the 3D picture is black. The full `--console series-s` profile
+stays black at the start screen and is not needed.
 
 ## What this branch changed
 
 | Commit | Change |
 |--------|--------|
+| `62ab248` | **Series S render path on a Series X profile** (`VICTORY_RENDER_S=1`, from Neptune): the title reads a Series S's device type and renders a 1920x1080 game plane under a 3840x2160 UI plane; present now draws the second plane over the first. 3.8 to 5.7 fps against 3.2 to 3.6 at 4K. |
+| `e726e53` | **The Series S upscaler through a PC FidelityFX DLL** (`VICTORY_FSR_DLL`, from Neptune): the title's FidelityFX calls go to AMD's PC DLL with the host device, list and textures. |
+| `65b8002` | Upload buffers in the card's memory through ReBAR (`VICTORY_REBAR_UPLOAD`, idea from rodrion-vi): GPU time down a little, frame rate unchanged here; off by default. |
+| `7272b73`, `790b134` | CPU-read detector (`VICTORY_WATCH_GPU_TEXTURES=1`, diagnostics): found the code that reads the water textures. |
 | `0df7901` | **Integer render targets are never blended.** A title blend state that blends every target, an `R8_UINT` one too, made the host refuse the mesh pipeline `[mesh f5e50eb2108c425b, pixel ce3f0432a08f1d35]` in every run (D3D12 error 676). It is made now. |
 | `a862386` | **A lane mask parked in other registers and moved back is the number it was.** Compute `926c46bab3b86bd6` translates now; the warm-up refuses 56 shaders instead of 58. |
 | `052038b` | Card test for the BVH box test: an absent child whose box is nearer sorts after a child that is there. |
@@ -61,42 +84,43 @@ lane-mask tests run the translated code on the card.
 From diagnostic runs on the test machine. Each is recorded with its evidence
 in the commit messages.
 
-- **The boat sinks.** Its hull goes from -2.1 m to -4.1 m in 40 s while the
-  water is at 0 m, and stops there. The "walls" in the water around the boat
-  and the swimmers are the water cut away around them (the title's
-  water-volume list), sitting under water. Ruled out: the water surface
-  shader (`f4fa58d124fdc362`, translates and validates), its volume list
-  (right sizes), its wave and ripple textures (small values), the ripple
-  query (`92b4790eb4c29f6d`, its results reach title memory), and the
-  ray-tracing resolve pass. **Found:** the title's CPU code reads two
-  textures the GPU writes, the 256x256 water simulation outputs
-  (`R32_FLOAT` and `R32G32_FLOAT`, read at `+0x4e61029`, `+0x4e61794` and
-  `+0x4e612d4` of its main image). On the console CPU and GPU share memory;
-  here those textures live on the card only, so the CPU reads stale memory.
-  Most likely what the boat's physics gets wrong; not yet proven by a fix.
-- **Missing textures.** The card is full (about 9.1 of a 10.3 GB budget);
+- **The boat sinks** because the title's CPU code reads two textures the
+  GPU writes: the 256x256 water simulation outputs (`R32_FLOAT` and
+  `R32G32_FLOAT`, read at `+0x4e61029`, `+0x4e61794` and `+0x4e612d4` of its
+  main image). On the console CPU and GPU share memory; here those textures
+  live on the card only, so the CPU read stale memory and the hull went from
+  -2.1 m to -4.1 m. Upstream's `texback` copies them back
+  (`VICTORY_TEXTURE_BACK=1`).
+- **Where a frame goes** (prison, 4K, run32, about 290 ms): copying GPU
+  results back to title memory about 160 ms (72 MB), the pass over the view
+  heap about 90 ms, uploads about 75 ms (190 MB). Neither chip is busy
+  (GPU about 60 %, CPU about 45 %): the time is the hand-off between them.
+  The Series S render path halves the copy-back's bytes.
+- **`VICTORY_HEAP_PASS_MARKED=1`** (already in the fork, off by default)
+  takes the heap pass from 136-203 ms to 86-102 ms.
+- **Tried without gain here:** ReBAR uploads, `VICTORY_WIDE_MERGE=1`,
+  `VICTORY_JOIN_COPIES=1`.
+- **Other builds on this PC:** Neptune (VIctory Edit.) 1.5 fps (its settings
+  overflow a 12 GB card: 11.1 GB used against a 10.3 GB budget); Belobug's AMD
+  fork about 3 fps with a black screen on the first run.
+- **Missing textures.** The card is full (about 8 to 9.7 of a 10 GB budget);
   textures picked by index wait, and the ones that never arrive draw black.
 - **Pipelines the title goes without.** About 30 a run go through device
   method `0x218`, which takes precompiled GFX10 code and a metadata block;
   its layout is not known yet.
-- **Dropped draws.** In every captured frame, the 100 to 600 draws dropped are
-  stages of the ray-tracing structure builder, which is off; no other draws
-  were lost there.
-- **Frame rate.** Each frame copies about 170 MB to the card and 65 MB back;
-  the card's own work is about a third of the frame.
+- **Dropped draws.** The 100 to 600 draws dropped per frame are stages of the
+  ray-tracing structure builder, which is off.
 
 ## Plan
 
-1. Boat physics: copy the two water simulation textures back to title memory
-   after the GPU writes them, then check that the boat floats.
-2. Missing textures: see which textures wait when the card is full, and keep
-   room for faces and other near objects. Try the Series S profile.
-3. Device method `0x218`: decode its layout from the saved calls, then build
-   those pipelines through the GFX10 translator.
-4. The 56 shaders that still do not translate, one error kind at a time,
-   with a test each.
-5. Frame rate: less copying between title memory and the card each frame;
-   the goal is at least 10 fps.
+1. Indoor light: test the ray-tracing structure builder
+   (`VICTORY_BVH_BUILDER=1`); if it is too slow or does not fit the card, a
+   stand-in ambient light as Neptune and Belobug have.
+2. Check the boat floats with `VICTORY_TEXTURE_BACK=1`.
+3. Frame rate: the copy-back (Neptune's own-queue fetch and quiet copy-back
+   need its write journal, which this tree does not have). Goal: 10 fps.
+4. Missing textures: keep room on a 12 GB card for faces and near objects.
+5. Device method `0x218`, and the 56 shaders that still do not translate.
 
 ## Inherited from the forks
 
@@ -150,7 +174,7 @@ target\release\victory.exe warm <game dir>
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
-`--console series-s` runs as a Series S. The window caption shows the frame
+For the Series S render path see "Recommended run" above. The window caption shows the frame
 rate. Saves, settings and `crashes.log` are under the data folder (default
 `%LOCALAPPDATA%\victory\data`).
 
@@ -239,6 +263,17 @@ Every build appends crashes and host GPU failures to `crashes.log`.
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
   (GPL-2.0-only): a reference for how the same title behaves under another
   layer; fixes it inspired were written anew.
+- **Neptune (VIctory Edit.)** by Traffic and zm0kie, as
+  [WillyboPeep/neptune-ve](https://github.com/WillyboPeep/neptune-ve) carries
+  it: the Series S render path (`VICTORY_RENDER_S`), the second present plane
+  and the FidelityFX redirect (`VICTORY_FSR_DLL`), ported here.
+- **[AnyXboxX](https://github.com/LooperSalty/AnyXboxX)** (LooperSalty): its
+  measured switch sets and notes pointed at the heap pass and the 12 GB limits.
+- **[rodrion-vi](https://github.com/Paradoxo321/rodrion-vi)** (Paradoxo321):
+  the ReBAR upload idea.
+- **AMD**: the signed FidelityFX upscaler DLL, from its
+  [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+  (not in this repository).
 - This fork's changes were developed by StrixEvo with
   [Claude Code](https://claude.com/claude-code).
 
