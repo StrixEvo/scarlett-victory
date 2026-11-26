@@ -1362,6 +1362,160 @@ fn plane_pass() -> Option<&'static PlanePass> {
     .as_ref()
 }
 
+/// Views of present planes drawn over the first one ([`Host::present`]): a
+/// ring, as a present sent ahead reads its view when it runs.
+const OVERLAY_VIEWS: u32 = 64;
+const OVERLAY: &str = r#"
+#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_LINEAR, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP, visibility = SHADER_VISIBILITY_PIXEL)"
+Texture2D<float4> plane : register(t0);
+SamplerState smooth : register(s0);
+struct Corner {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+Corner corner(uint i : SV_VertexID) {
+    Corner c;
+    c.uv = float2(float(i & 1) * 2.0, float(i >> 1) * 2.0);
+    c.position = float4(c.uv.x * 2.0 - 1.0, 1.0 - c.uv.y * 2.0, 0.0, 1.0);
+    return c;
+}
+[RootSignature(RS)]
+float4 over(Corner c) : SV_Target {
+    return plane.SampleLevel(smooth, c.uv, 0.0);
+}
+"#;
+
+/// The pass that draws a second present plane over the first: the title's
+/// UI plane (premultiplied alpha, the display's size) over its game plane,
+/// scaled to the back buffer, as the console's display composes them.
+struct OverlayPass {
+    root: ID3D12RootSignature,
+    vs: Vec<u8>,
+    ps: Vec<u8>,
+    /// By back buffer format.
+    pipelines: Mutex<Vec<(i32, Option<ID3D12PipelineState>)>>,
+    views: ID3D12DescriptorHeap,
+    cpu: usize,
+    gpu: u64,
+    step: u32,
+    next: AtomicU32,
+    target: ID3D12DescriptorHeap,
+}
+// SAFETY: free-threaded D3D12 objects and plain data.
+unsafe impl Send for OverlayPass {}
+// SAFETY: as above.
+unsafe impl Sync for OverlayPass {}
+
+fn overlay_pass() -> Option<&'static OverlayPass> {
+    static PASS: OnceLock<Option<OverlayPass>> = OnceLock::new();
+    PASS.get_or_init(|| {
+        use windows::core::s;
+        let host = host()?;
+        let made = || -> windows::core::Result<OverlayPass> {
+            let vs = compile(OVERLAY, s!("corner"), s!("vs_5_1"))?;
+            let ps = compile(OVERLAY, s!("over"), s!("ps_5_1"))?;
+            // SAFETY: plain creation; the root signature is inside the pixel shader.
+            unsafe {
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &ps[..])?;
+                let views: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: OVERLAY_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })?;
+                let target: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })?;
+                Ok(OverlayPass {
+                    root,
+                    vs,
+                    ps,
+                    pipelines: Mutex::default(),
+                    cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
+                    gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
+                    step: host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+                    views,
+                    next: AtomicU32::new(0),
+                    target,
+                })
+            }
+        };
+        match made() {
+            Ok(pass) => {
+                tracing::info!("a second present plane is drawn over the first (the title's UI over its game plane)");
+                Some(pass)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no pass to draw a second present plane: the first is shown alone");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+impl OverlayPass {
+    fn pipeline(&self, device: &ID3D12Device, format: DXGI_FORMAT) -> Option<ID3D12PipelineState> {
+        let mut made = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, pipeline)) = made.iter().find(|m| m.0 == format.0) {
+            return pipeline.clone();
+        }
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        };
+        // SAFETY: the description points at live data and never releases its pointer.
+        let pipeline = unsafe {
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&self.root),
+                VS: code(&self.vs[..]),
+                PS: code(&self.ps[..]),
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            desc.RTVFormats[0] = format;
+            // Premultiplied alpha: the plane's colour over what is there.
+            desc.BlendState.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: true.into(),
+                SrcBlend: D3D12_BLEND_ONE,
+                DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+                BlendOp: D3D12_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D12_BLEND_ONE,
+                DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+                BlendOpAlpha: D3D12_BLEND_OP_ADD,
+                LogicOp: D3D12_LOGIC_OP_NOOP,
+                RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+                ..Default::default()
+            };
+            device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc)
+        };
+        let pipeline = match pipeline {
+            Ok(pipeline) => Some(pipeline),
+            Err(e) => {
+                tracing::warn!(error = %e, format = format.0, "no pipeline to draw a second present plane");
+                None
+            }
+        };
+        made.push((format.0, pipeline.clone()));
+        pipeline
+    }
+}
+
 /// Compiles function `entry` of `source` for `target` with the system's
 /// compiler, as the indirect-argument clamp is (`crate::indirect`).
 pub(crate) fn compile(
@@ -9245,14 +9399,22 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// Shows `texture` (in `state`); `over`: a second present plane (in
+    /// its state), the title's UI drawn over its game plane.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        over: Option<(&ID3D12Resource, u32)>,
+    ) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(texture, state, frame, over);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64, over: Option<(&ID3D12Resource, u32)>) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -9337,6 +9499,18 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            // A second plane over the first (the title's UI over its game
+            // plane, its Series S render path: `VICTORY_RENDER_S`); `back`
+            // is then a copy's destination again for the box below.
+            if over.is_some_and(|(plane, before)| {
+                self.record_overlay(list, &back, format, (width, height), plane, D3D12_RESOURCE_STATES(before as i32))
+            }) {
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+            }
             // The frame rate, into the corner of what is shown (not of the
             // title's own frame, which the lines below read back).
             crate::fpsbox::draw(self, list, &back, (width, height, format));
@@ -9384,6 +9558,96 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
+    }
+
+    /// Records into `list` the draw of `plane` (in the state `before`) over
+    /// `back`, which holds the first plane and is a copy destination: true if
+    /// recorded, with `back` then a render target and `plane` as it was.
+    fn record_overlay(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        back: &ID3D12Resource,
+        format: DXGI_FORMAT,
+        size: (u32, u32),
+        plane: &ID3D12Resource,
+        before: D3D12_RESOURCE_STATES,
+    ) -> bool {
+        let Some(pass) = overlay_pass() else { return false };
+        // SAFETY: a live resource.
+        let of = unsafe { plane.GetDesc() };
+        let Some(view_format) = swap_format(of.Format) else { return false };
+        if of.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || of.SampleDesc.Count != 1 {
+            return false;
+        }
+        let Some(pipeline) = pass.pipeline(&self.device, format) else { return false };
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(
+                plane_width = of.Width,
+                plane_height = of.Height,
+                plane_format = of.Format.0,
+                width = size.0,
+                height = size.1,
+                "the title presents a second plane: drawn over the first"
+            );
+        });
+        let slot = pass.next.fetch_add(1, Ordering::Relaxed) % OVERLAY_VIEWS;
+        let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: view_format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        const SHADER_RESOURCE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        // SAFETY: live resources, our heaps and list.
+        unsafe {
+            self.device.CreateShaderResourceView(
+                plane,
+                Some(&view),
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: pass.cpu + (slot * pass.step) as usize },
+            );
+            let target = pass.target.GetCPUDescriptorHandleForHeapStart();
+            self.device.CreateRenderTargetView(back, None, target);
+            let mut barriers = vec![transition(back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET)];
+            if before != SHADER_RESOURCE {
+                barriers.push(transition(plane, before, SHADER_RESOURCE));
+            }
+            list.ResourceBarrier(&barriers);
+            list.SetGraphicsRootSignature(&pass.root);
+            list.SetPipelineState(&pipeline);
+            list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+            list.SetGraphicsRootDescriptorTable(
+                0,
+                D3D12_GPU_DESCRIPTOR_HANDLE { ptr: pass.gpu + u64::from(slot * pass.step) },
+            );
+            list.OMSetRenderTargets(1, Some(&target), false, None);
+            list.RSSetViewports(&[D3D12_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: size.0 as f32,
+                Height: size.1 as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]);
+            list.RSSetScissorRects(&[RECT {
+                left: 0,
+                top: 0,
+                right: size.0 as i32,
+                bottom: size.1 as i32,
+            }]);
+            list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.DrawInstanced(3, 1, 0, 0);
+            if before != SHADER_RESOURCE {
+                list.ResourceBarrier(&[transition(plane, SHADER_RESOURCE, before)]);
+            }
+        }
+        true
     }
 
     fn presenter(

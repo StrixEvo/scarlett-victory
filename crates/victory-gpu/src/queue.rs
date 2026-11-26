@@ -894,7 +894,7 @@ fn release_held_now(all: bool) {
                     Held::Present(texture, state, frame) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let _ = host.present(&texture, state, frame, None);
                             }
                         };
                         if all {
@@ -1403,9 +1403,33 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
+        const SHADER_RESOURCE: u32 = 0x80;
+        // A plane description is 0x48 bytes: token, count, resources, two
+        // parameter pointers, four words of zero.
+        const PLANE_BYTES: usize = 0x48;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // A second plane is drawn over the first, as the console's display
+        // composes them: the title's UI at the display's size over a smaller
+        // game plane (its Series S render path, `VICTORY_RENDER_S`). From
+        // Neptune (VIctory Edit.).
+        let over = (planes > 1)
+            // SAFETY: the title passes `planes` plane descriptions.
+            .then(|| unsafe { &*plane_parameters.cast::<u8>().add(PLANE_BYTES).cast::<Plane>() })
+            .filter(|p| p.count > 0 && !p.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .map(|p| unsafe { *p.resources })
+            .filter(|&other| other != resource)
+            .and_then(|other| crate::resource::host_resource(other).map(|t| (other, t)))
+            .map(|(other, t)| {
+                let before = crate::resource::host_transition(other, SHADER_RESOURCE)
+                    .map_or(SHADER_RESOURCE, |(_, before)| before);
+                (other, t, before)
+            });
+        let shown = host.present(texture, state, frame, over.map(|(_, t, before)| (t, before)));
+        if let Some((other, _, before)) = over {
+            crate::resource::host_transition(other, before);
+        }
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
