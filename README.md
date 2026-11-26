@@ -51,6 +51,7 @@ $env:VICTORY_HEAP_PASS_MARKED = '1'  # heap pass looks only at changed slots
 $env:VICTORY_RENDER_S = '1'          # Series S render path: 3D at 1080p
 $env:VICTORY_FSR_DLL = '<path>\amd_fidelityfx_upscaler_dx12.dll'
 $env:VICTORY_AMBIENT = '2'          # stand-in indirect light: rooms lit
+$env:VICTORY_QUEUE2 = '3'           # copy-back and uploads on the copy engine
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
@@ -98,6 +99,10 @@ in the commit messages.
   heap about 90 ms, uploads about 75 ms (190 MB). Neither chip is busy
   (GPU about 60 %, CPU about 45 %): the time is the hand-off between them.
   The Series S render path halves the copy-back's bytes.
+- **`VICTORY_QUEUE2=3`** (in the fork, off by default) moves the copy-back
+  fetch and the uploads of changed bytes to the card's copy engine: copy-back
+  104-143 ms to 37-48 ms a frame (run41 to run42); the frame itself barely
+  moved, its time went to preparing (about 110 ms) and uploads (about 60 ms).
 - **`VICTORY_HEAP_PASS_MARKED=1`** (already in the fork, off by default)
   takes the heap pass from 136-203 ms to 86-102 ms.
 - **Tried without gain here:** ReBAR uploads, `VICTORY_WIDE_MERGE=1`,
