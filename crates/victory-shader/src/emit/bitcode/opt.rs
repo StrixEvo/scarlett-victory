@@ -63,7 +63,11 @@ pub const WIDE: u32 = 64;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const ALL: u32 = MODULE | FIRST;
+pub const ALL: u32 = MODULE | FIRST | WIDE;
+/// The passes that run when nothing says which: every one but [`WIDE`],
+/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
+/// for it).
+pub const DEFAULT: u32 = ALL & !WIDE;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
