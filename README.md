@@ -1,5 +1,67 @@
 # VIctory fork (work in progress)
 
+## Scarlett-Victory (branch `scarlett/shader-raytracing`, 2026-11-26)
+
+Graphics work on top of the forks below, tested on one machine: Windows 11,
+Radeon RX 6700 XT 12 GB, Ryzen 5 5600X, 32 GB RAM, Series X profile. The world
+runs at about 3 frames per second.
+
+Changed on this branch:
+
+- **Integer render targets are never blended** (`0df7901`): a title blend state
+  that blends every target, an `R8_UINT` one too, made the host refuse the mesh
+  pipeline `[mesh f5e50eb2108c425b, pixel ce3f0432a08f1d35]` in every run. It is
+  made now.
+- **A lane mask parked in other registers and moved back is the number it was**
+  (`a862386`): compute `926c46bab3b86bd6` translates now (warm-up: 58 shaders
+  refused before, 56 now).
+- **Card test for the BVH box test** (`052038b`): an absent child whose box is
+  nearer sorts after a child that is there.
+- Defaults (`374021e`): texture room 94 % of the card, ray-tracing resolve
+  pipelines made.
+
+Diagnostics (diagnostics builds, `cargo build --profile diag -p victory --features diagnostics`):
+
+- `VICTORY_CAPTURE=<dir>`: **F9** captures the next frame (targets as PNG, every
+  draw in `frame-<n>-ops.txt`).
+- `VICTORY_DUMP_SHADER=<hash,...>`: on captured frames, the raw buffers those
+  shaders read, saved next to the PNGs.
+- Dropped draws are counted by reason with their shaders
+  (`made, not bound (<why>) [...]`).
+- Device methods 0x1c8/0x218 (pipelines the title goes without): with
+  `VICTORY_SHADER_SAVE`, their first 64 calls are saved whole.
+- `VICTORY_WATCH_GPU_TEXTURES=1`: logs code that reads or writes the memory of
+  textures the GPU writes ("the CPU touches a texture the GPU writes").
+
+Found, not fixed yet:
+
+- **The boat sinks as soon as the cutscene hands over to play** (hull height
+  -2.1 m to -4.1 m in 40 s, water at 0). The "walls" in the water around the
+  boat and swimmers are the water cut away around them, sitting under water.
+  The water shader, its water-volume list and the ripple query read right.
+  The cause is in what feeds the game's own physics; the check under way is
+  whether it reads a texture the GPU writes (those live on the card only here).
+- **Faces and some foliage have no texture** (magenta with
+  `VICTORY_NULL_MAGENTA=1`, black without): the card is full (about 9.1 of
+  10.3 GB budget) and textures wait.
+- **About 30 pipelines a run are never made**: device method 0x218 takes
+  precompiled GFX10 code and its layout is not known yet.
+- **Speed**: each frame copies about 170 MB to the card and 65 MB back; the
+  card's own work is about a third of the frame.
+
+Plan, in order:
+
+1. Boat physics: find the input it reads wrong (CPU reads of GPU-written
+   textures first), then copy that data back to title memory.
+2. Missing textures: see which textures wait when the card is full, and keep
+   room for faces and other close objects.
+3. Device method 0x218: decode its layout from the saved calls, then build
+   those pipelines through the existing GFX10 translator.
+4. Remaining untranslatable shaders (56), one error kind at a time, with a
+   test each.
+5. Frame rate: less copying between title memory and the card each frame;
+   the goal is at least 10 frames per second.
+
 ## victory-amd
 
 This copy is a fork of
