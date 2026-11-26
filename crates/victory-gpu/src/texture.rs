@@ -336,7 +336,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
     let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
-        let state = crate::host::legal_state(texture, COPY_SOURCE);
+        let state = list.legal(texture, COPY_SOURCE);
         let barrier = crate::host::transition(
             texture,
             D3D12_RESOURCE_STATES(before as i32),
@@ -429,6 +429,14 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// With [`no_wait`]: whether a texture never filled whose read through the
+/// kernel failed is read through the copy instead, unmapped pages as zeros
+/// (`VICTORY_NO_WAIT_FILL=0`: not, as before). See `refresh_unlocked`.
+fn no_wait_fill() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_WAIT_FILL").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -1286,6 +1294,28 @@ impl Staging {
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
             size
+        } else if last.hash.is_none() && no_wait_fill() {
+            // Never filled, and the kernel's read failed (a page of it was
+            // being remapped). A texture picked by index has no next
+            // refresh: it went up as all zeros for the rest of the run
+            // (the player character's skin black in prologue runs, fork
+            // issue #923). Read through the copy as the partly mapped case
+            // does: missing pages read as zeros, mapped pages their bytes.
+            // From HLVM04's fix in that issue.
+            UNLOCKED[1].fetch_add(1, Relaxed);
+            let filled = with_read(size, |read| {
+                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                if read.iter().all(|&b| b == 0) {
+                    return false;
+                }
+                last.hash = Some(blake3::hash(read));
+                self.detile(read);
+                true
+            });
+            if !filled {
+                last.asked = 0;
+            }
+            if filled { size } else { 0 }
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
