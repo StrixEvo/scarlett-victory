@@ -38,7 +38,7 @@ about 6 fps.
 | Boot, menus, start screen | works, 30 fps |
 | Opening cutscenes | play; characters, boat, water and sky are drawn |
 | The prison (first walk-around) | **3.8 to 5.7 fps** with the Series S render path and the AMD FSR DLL (run38); 3.2 to 3.6 fps at 4K (run32) |
-| Indoor light | **missing**: anything the sun does not reach is near-black, because the ray-traced indirect light does not run (the structure builder is off by default); `VICTORY_BVH_BUILDER=1` is being tested |
+| Indoor light | the ray-traced indirect light does not run (`VICTORY_BVH_BUILDER=1` crashes the title: it reads structure sizes before they land). A stand-in from Belobug's fork, `VICTORY_AMBIENT=2`, lights rooms close to the console's look at no cost in frame rate |
 | The boat | the cause of the sinking is found (see Findings); the fix (`VICTORY_TEXTURE_BACK=1`) is in, not yet checked in game |
 | Faces, some foliage and bridges | sometimes without their texture: the 12 GB card runs out of texture room |
 | Stability | runs of 5 to 30 minutes end normally; no device loss in the latest runs |
@@ -50,6 +50,7 @@ $env:VICTORY_TEXTURE_BACK = '1'      # water maps back to the CPU (boat)
 $env:VICTORY_HEAP_PASS_MARKED = '1'  # heap pass looks only at changed slots
 $env:VICTORY_RENDER_S = '1'          # Series S render path: 3D at 1080p
 $env:VICTORY_FSR_DLL = '<path>\amd_fidelityfx_upscaler_dx12.dll'
+$env:VICTORY_AMBIENT = '2'          # stand-in indirect light: rooms lit
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
@@ -65,6 +66,7 @@ stays black at the start screen and is not needed.
 
 | Commit | Change |
 |--------|--------|
+| `036b70b` | **Stand-in indirect light** (`VICTORY_AMBIENT`, from Belobug's AMD fork): rooms the sun does not reach are lit from an estimate of the frame's own light. |
 | `62ab248` | **Series S render path on a Series X profile** (`VICTORY_RENDER_S=1`, from Neptune): the title reads a Series S's device type and renders a 1920x1080 game plane under a 3840x2160 UI plane; present now draws the second plane over the first. 3.8 to 5.7 fps against 3.2 to 3.6 at 4K. |
 | `e726e53` | **The Series S upscaler through a PC FidelityFX DLL** (`VICTORY_FSR_DLL`, from Neptune): the title's FidelityFX calls go to AMD's PC DLL with the host device, list and textures. |
 | `65b8002` | Upload buffers in the card's memory through ReBAR (`VICTORY_REBAR_UPLOAD`, idea from rodrion-vi): GPU time down a little, frame rate unchanged here; off by default. |
