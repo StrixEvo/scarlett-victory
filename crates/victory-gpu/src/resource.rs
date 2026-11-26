@@ -1177,6 +1177,12 @@ pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
 static TEXTURES: std::sync::Mutex<std::collections::BTreeSet<usize>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
+/// Whether `this` is a title texture of ours (`crate::external`).
+#[cfg(windows)]
+pub(crate) fn is_texture(this: This) -> bool {
+    textures().contains(&(this as usize))
+}
+
 #[cfg(windows)]
 fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())

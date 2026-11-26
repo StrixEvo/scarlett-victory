@@ -302,6 +302,17 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     } else {
         format!("{file}.dll")
     };
+    // The title's FidelityFX loader, redirected to the PC DLL
+    // (`VICTORY_FSR_DLL`), is never mapped from the title's folder.
+    #[cfg(windows)]
+    if super::fidelityfx::replaces(&file)
+        && let Some(m) = registry().iter().find(|m| m.serves(&file))
+    {
+        if load {
+            tracing::info!(dll = file, "redirected to the PC FidelityFX DLL");
+        }
+        return Some(handle(m));
+    }
     // Loads go through the title DLL loader first: it waits for a DLL that
     // another thread is still initialising, as the Windows loader lock does.
     if load {

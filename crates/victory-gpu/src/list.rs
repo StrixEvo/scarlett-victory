@@ -139,6 +139,27 @@ struct Part {
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
+/// Whether `this` is a command list of ours (either table).
+pub(crate) fn is_list(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // SAFETY: a title object's first word is its table; only read.
+    let table = unsafe { (*this).table() };
+    table == LIST_FUNCTIONS.0.as_ptr() || table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+}
+
+/// Runs `f` with the host list behind `this` and the draw state the title
+/// set on it; `false` if `this` has no host list (`crate::external`).
+#[cfg(windows)]
+pub(crate) fn with_host(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) -> bool {
+    if !is_list(this) || host_list(this).is_none() {
+        return false;
+    }
+    with_state(this, f);
+    true
+}
+
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
