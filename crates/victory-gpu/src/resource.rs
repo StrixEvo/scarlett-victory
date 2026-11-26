@@ -2304,6 +2304,18 @@ fn hand_out_resource(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(resource.data() as u64, at);
+            // Which code touches its title memory (`VICTORY_WATCH_GPU_TEXTURES`).
+            #[cfg(feature = "diagnostics")]
+            if let Some(info) = footprint(&desc) {
+                crate::cpu_reads::watch(
+                    resource.data() as usize,
+                    info.size as usize,
+                    format!(
+                        "{}x{}x{} f{} flags {:#x}",
+                        desc.width, desc.height, desc.depth_or_array_size, desc.format, desc.flags
+                    ),
+                );
+            }
         }
         if !lazy() {
             let _ = hosted(at as This, true);
@@ -2325,6 +2337,10 @@ impl Drop for Resource {
         if self.desc.dimension != BUFFER {
             textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
             if !fills(&self.desc) {
+                #[cfg(feature = "diagnostics")]
+                if let Some(info) = footprint(&self.desc) {
+                    crate::cpu_reads::forget(self.data() as usize, info.size as usize);
+                }
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
                 if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
