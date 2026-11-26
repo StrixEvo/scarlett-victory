@@ -5,8 +5,8 @@
 This copy is a fork of
 [fxceless/victory-fork](https://github.com/fxceless/victory-fork), itself a fork
 of [VIctory](https://github.com/Marvisak/VIctory). It adds fixes found while
-running on an AMD card, tested on one machine only: Windows 11, Radeon RX 7800 XT
-16 GB (driver 32.0.32029.2010), Ryzen 5 7500F, 32 GB RAM.
+running on an AMD card, tested on one machine only: Windows 11, Radeon RX 6700 XT
+12 GB (driver 32.0.32029.2010), Ryzen 5 5600x, 32 GB RAM.
 
 State on that machine (2026-11-25, Series X profile): the prologue's cutscene and
 the first room are drawn, with the player moving, at 2 to 3 frames per second.
