@@ -68,10 +68,12 @@ in the commit messages.
   shader (`f4fa58d124fdc362`, translates and validates), its volume list
   (right sizes), its wave and ripple textures (small values), the ripple
   query (`92b4790eb4c29f6d`, its results reach title memory), and the
-  ray-tracing resolve pass. The game's own physics gets something wrong; the
-  check under way is whether it reads a texture the GPU writes (on the
-  console CPU and GPU share memory; here those textures live on the card
-  only).
+  ray-tracing resolve pass. **Found:** the title's CPU code reads two
+  textures the GPU writes, the 256x256 water simulation outputs
+  (`R32_FLOAT` and `R32G32_FLOAT`, read at `+0x4e61029`, `+0x4e61794` and
+  `+0x4e612d4` of its main image). On the console CPU and GPU share memory;
+  here those textures live on the card only, so the CPU reads stale memory.
+  Most likely what the boat's physics gets wrong; not yet proven by a fix.
 - **Missing textures.** The card is full (about 9.1 of a 10.3 GB budget);
   textures picked by index wait, and the ones that never arrive draw black.
 - **Pipelines the title goes without.** About 30 a run go through device
@@ -85,8 +87,8 @@ in the commit messages.
 
 ## Plan
 
-1. Boat physics: find the input it reads wrong, then give it the right data
-   (for a texture the GPU writes: copy it back to title memory).
+1. Boat physics: copy the two water simulation textures back to title memory
+   after the GPU writes them, then check that the boat floats.
 2. Missing textures: see which textures wait when the card is full, and keep
    room for faces and other near objects. Try the Series S profile.
 3. Device method `0x218`: decode its layout from the saved calls, then build
