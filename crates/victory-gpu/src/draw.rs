@@ -2742,11 +2742,47 @@ impl State {
         let mut out = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
+            let hash = stage.shader.hash.to_string();
+            let dump = dump_wanted(&hash);
+            if dump {
+                let roots = stage.root_cbvs.iter().chain(&stage.root_srvs);
+                for &(slot, _) in roots.chain(&stage.root_uavs) {
+                    if let Some(Root::View(a)) = self.roots_ref(compute).get(usize::from(slot)) {
+                        dump_memory(&hash, &format!("root{slot}"), *a, 0x1_0000);
+                    }
+                }
+            }
             for u in &t.used {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        describe(crate::descriptor::view(handle).as_ref())
+                        let view = crate::descriptor::view(handle);
+                        if dump {
+                            let at = format!("s{}+{}", u.slot, u.table_offset_dwords);
+                            match view.as_ref() {
+                                // A buffer of memory: its resource's width in bytes from the
+                                // view's address.
+                                Some(View::Placed(_, r, d)) if r[0] == 1 => {
+                                    let width = u64::from(r[4]) | u64::from(r[5]) << 32;
+                                    let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+                                    dump_memory(&hash, &at, address, width);
+                                }
+                                Some(View::Constant(address, size)) => {
+                                    dump_memory(&hash, &at, *address, u64::from(*size));
+                                }
+                                // A buffer view of a resource (written by the shader, as a
+                                // query's results): what title memory holds there now.
+                                Some(v @ (View::Unordered(..) | View::Shader(..))) => {
+                                    if let Some((address, size)) =
+                                        crate::descriptor::host::buffer_range(v)
+                                    {
+                                        dump_memory(&hash, &at, address, size);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        describe(view.as_ref())
                     }
                     (root, _) => format!("{root:?}"),
                 };
@@ -3402,6 +3438,64 @@ fn view_state(view: Option<&View>) -> String {
         }
         Some(v) => format!("{v:?}").chars().take(80).collect(),
     }
+}
+
+/// Whether the buffers a shader reads are to be saved now: it is named in
+/// `VICTORY_DUMP_SHADER` (comma-separated hashes) and the frame being recorded is captured
+/// ([`crate::capture::listed`], F9 included) into a capture folder (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn dump_wanted(hash: &str) -> bool {
+    static NAMED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let named = NAMED.get_or_init(|| {
+        std::env::var("VICTORY_DUMP_SHADER")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    !named.is_empty()
+        && named.iter().any(|h| h == hash)
+        && crate::capture::folder().is_some()
+        && crate::capture::listed(crate::queue::presented() + 1)
+}
+
+/// `size` bytes of title memory at `address` (at most 32 MiB; less if the end is not
+/// mapped) to `frame-<n>-<hash>-<at>-<address>-<size>.bin` in the capture folder, once per
+/// frame and address (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn dump_memory(hash: &str, at: &str, address: u64, size: u64) {
+    static DONE: std::sync::Mutex<Option<std::collections::HashSet<(u64, u64)>>> =
+        std::sync::Mutex::new(None);
+    let Some(folder) = crate::capture::folder() else {
+        return;
+    };
+    let frame = crate::queue::presented() + 1;
+    if address == 0 || size == 0 || size > 32 << 20 {
+        return;
+    }
+    if !DONE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert((frame, address))
+    {
+        return;
+    }
+    // Shorter reads until one is mapped through.
+    let mut len = size as usize;
+    while len >= 16 {
+        let mut bytes = vec![0u8; len];
+        if crate::host::read_into(address as *const u8, &mut bytes) {
+            let name = format!("frame-{frame}-{hash}-{at}-{address:#x}-{len:#x}.bin");
+            if let Err(e) = std::fs::write(folder.join(&name), &bytes) {
+                tracing::warn!(error = %e, name, "shader input not saved");
+            }
+            return;
+        }
+        len /= 2;
+    }
+    tracing::warn!(address = format_args!("{address:#x}"), size, "shader input not readable");
 }
 
 /// A view in a few words (diagnostics builds).
