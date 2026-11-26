@@ -1491,10 +1491,21 @@ pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
+        // The 3,072 MB are the Series X render path's targets at 4K. The
+        // Series S render path (`--console series-s`, or `VICTORY_RENDER_S`
+        // on a Series X profile) renders 1920x1080: its targets came to
+        // about 1.4 GB in Neptune's run ve135, so 3,072 kept 1.6 GB for
+        // targets never made, the card stood "full" and the texture queue
+        // was refused from the first world frame on (faces black; 78,500
+        // refusals and 8,410 textures waiting in run41 here). From Neptune
+        // (VIctory Edit.).
+        let series_s = crate::console::current() == crate::console::Console::SeriesS
+            || std::env::var_os("VICTORY_RENDER_S").is_some_and(|v| v != "0");
+        let default: u64 = if series_s { 1536 } else { 3072 };
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or(default << 20, |mb| mb.min(8192) << 20)
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
