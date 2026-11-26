@@ -344,6 +344,15 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
         });
         triangle_nodes.push((s.add(nodes::triangles(&v, 9), 16), 0));
     }
+    // An absent child whose box the ray enters first, before a child that
+    // is there (the reference's own test): sorted, the child that is there
+    // comes first. Added after the random nodes, so their numbers stay.
+    let ids3 = [bvh::NONE, 8, bvh::NONE, bvh::NONE];
+    let nearer = [UNIT, moved(UNIT, [4.0, 0.0, 0.0]), off, off];
+    let absent_first = [
+        (s.add(nodes::box32(ids3, nearer), 32), 5),
+        (s.add(nodes::box16(ids3, nearer), 16), 4),
+    ];
     let mut cases: Vec<Case> = Vec::new();
     // Rays of the reference's tests against the lined-up boxes.
     for &(n, kind) in &box_nodes[..2] {
@@ -398,6 +407,13 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
         5,
         Ray::new([-5.0, 0.0, 0.0], [1.0, f32::NAN, 0.0], 100.0),
     )));
+    for (n, kind) in absent_first {
+        cases.push(Some((
+            n,
+            kind,
+            Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 10.0),
+        )));
+    }
     // Rays at every triangle: aimed inside, at an edge, at a vertex, past
     // it, from both sides, along each axis.
     for &(n, kind) in &triangle_nodes {
