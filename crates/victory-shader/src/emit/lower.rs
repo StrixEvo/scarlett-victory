@@ -83,14 +83,30 @@ pub(crate) struct Parts<'a> {
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
+    /// Joins found read (through a scalar copy) only once joins were being filled, when they
+    /// may have been filled already: redo with them read from the start.
+    Read(Vec<Value>),
     Fail(ShaderError),
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut read = HashSet::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, &read).run() {
             Ok(l) => return Ok(l),
+            Err(Stop::Read(joins)) => {
+                let mut grew = false;
+                for v in joins {
+                    grew |= read.insert(v);
+                }
+                if !grew {
+                    return Err(ShaderError::Unsupported {
+                        offset: 0,
+                        what: "a phi that does not settle",
+                    });
+                }
+            }
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
@@ -198,6 +214,11 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
+    /// Data joins are being filled (`fill_phis`): one not marked read by now may have been
+    /// filled already, with zero for what it was not known to need.
+    filling: bool,
+    /// Joins found read only while filling ([`Stop::Read`]).
+    late_reads: Vec<Value>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -1246,7 +1267,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, read: &HashSet<Value>) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1497,7 +1518,9 @@ impl<'a> Lower<'a> {
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
-            read_phis: HashSet::new(),
+            read_phis: read.clone(),
+            filling: false,
+            late_reads: Vec::new(),
             stale: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
@@ -2277,7 +2300,12 @@ impl<'a> Lower<'a> {
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
-        self.fill_phis()?;
+        if let Err(e) = self.fill_phis() {
+            if !self.late_reads.is_empty() {
+                return Err(Stop::Read(std::mem::take(&mut self.late_reads)));
+            }
+            return Err(e);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -3130,6 +3158,28 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// The value `v` copies, when a scalar move (`s_mov_b32`, `s_mov_b64`) from scalar
+    /// registers writes it: each dword written is the dword read in its place.
+    fn scalar_copy_source(&self, v: Value) -> Option<Value> {
+        let b = *self.def_block.get(&v)?;
+        let inst = self.x.p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        if !matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
+            || inst.reads.len() != inst.writes.len()
+            || !inst
+                .reads
+                .iter()
+                .chain(&inst.writes)
+                .all(|r| matches!(r.0, Reg::S(_)))
+        {
+            return None;
+        }
+        let k = inst.writes.iter().position(|w| w.1 == v)?;
+        Some(inst.reads[k].1)
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -3144,6 +3194,27 @@ impl<'a> Lower<'a> {
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
+            // A scalar move copies every bit whatever EXEC holds: a mask parked in other
+            // registers and moved back (the compiler frees its registers around a stretch
+            // that reuses them) is the number its source is, whose ballot may be taken where
+            // that source is written.
+            // Read through `get`, which marks a join it reads (a register the loop carries,
+            // joined as data): a join left unmarked brings zero for a mask coming into it.
+            // While joins are filled, one not marked yet may be filled already: lowered
+            // again with it read from the start ([`Stop::Read`]).
+            if let Some(source) = self.scalar_copy_source(v) {
+                if self.filling
+                    && self.phi_at.contains_key(&source)
+                    && !self.read_phis.contains(&source)
+                {
+                    self.late_reads.push(source);
+                    return Err(MASK_ELSEWHERE);
+                }
+                return match self.get(source)? {
+                    Val::I32(x) => Ok(x),
+                    _ => Err(MASK_ELSEWHERE),
+                };
+            }
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
@@ -11252,6 +11323,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        self.filling = true;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;

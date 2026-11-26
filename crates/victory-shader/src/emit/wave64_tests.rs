@@ -419,7 +419,7 @@ fn a_wave_or_inside(skip: u32, name: &str) {
 
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
 /// of the UAV; None (and a line) without a device that takes it.
-fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
+fn on_the_card<const N: usize>(shader: &HostShader, constants: [u32; N]) -> Option<u32> {
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 hardware device; not run");
         return None;
@@ -430,8 +430,10 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     };
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
-        if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
-            ud[u.index as usize] = constants[d as usize];
+        if let (RootType::Constants, 0, d) = (u.root, u.slot, u.dword)
+            && let Some(&c) = constants.get(d as usize)
+        {
+            ud[u.index as usize] = c;
         }
     }
     let out = host
@@ -479,6 +481,112 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
         assert_eq!(got, expected, "{below} lanes in the mask, s1 = {other}");
     }
     eprintln!("ran on the hardware device: the mask's bits, or the number");
+}
+
+/// As above, and then, inside `if (t < s2)`, the register is parked in another
+/// (`s_mov`), used for a number of its own, moved back and read as a number there, where not
+/// every lane runs (`926c46bab3b86bd6`: s[24:25] parked in s[96:97] at 0x163c, back at
+/// 0x1a54, joined as data at the loop header 0x13c8). A move copies every bit whatever EXEC
+/// holds: what is read is what was parked, the mask's ballot or the number.
+#[test]
+fn a_parked_lane_mask_moved_back_where_not_every_lane_runs_is_the_number_it_was() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+        0xBE94_036A, // s_mov_b32 s20, vcc_lo
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0001, // s_cbranch_scc1 over the next
+        0xBE94_0385, // s_mov_b32 s20, 5
+        0x7D88_0002, // v_cmp_gt_u32 vcc_lo, s2, v0
+        0xBE8D_3C6A, // s_and_saveexec_b32 s13, vcc_lo
+        0xBF88_0006, // s_cbranch_execz over the body
+        0xBE95_0314, // s_mov_b32 s21, s20 (parked)
+        0xBE94_0387, // s_mov_b32 s20, 7 (the register reused)
+        0xBE94_0315, // s_mov_b32 s20, s21 (moved back)
+        0x7E00_0214, // v_mov_b32 v0, s20
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0xBEFE_030D, // s_mov_b32 exec_lo, s13
+    ];
+    let native = native_of(&words, false, 32);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // (lanes in the mask, s1, lanes inside the branch) -> what they store
+    for (below, other, inside, expected) in [
+        (32u32, 0u32, 32u32, u32::MAX),
+        (10, 0, 4, 0x3FF),
+        (10, 0, 31, 0x3FF),
+        (0, 0, 5, 0),
+        (10, 1, 4, 5),
+    ] {
+        let Some(got) = on_the_card(&shader, [below, other, inside]) else {
+            return;
+        };
+        assert_eq!(
+            got, expected,
+            "{below} lanes in the mask, s1 = {other}, {inside} lanes inside"
+        );
+    }
+    eprintln!("ran on the hardware device: the parked mask's bits, or the number");
+}
+
+/// As above, read after `if (t < s2) { park; reuse; move back }` ends instead: the register
+/// is joined there from the branch and from the lanes that skipped it, and the mask comes in
+/// through the join, found only while the joins are filled (as the loop header of
+/// `926c46bab3b86bd6` finds it). The join it was parked from must then be filled as read,
+/// with the mask's ballot: left unread it brought zero for the mask.
+#[test]
+fn a_parked_lane_mask_moved_back_and_joined_is_the_number_it_was() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+        0xBE94_036A, // s_mov_b32 s20, vcc_lo
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0001, // s_cbranch_scc1 over the next
+        0xBE94_0385, // s_mov_b32 s20, 5
+        0x7D88_0002, // v_cmp_gt_u32 vcc_lo, s2, v0
+        0xBE8D_3C6A, // s_and_saveexec_b32 s13, vcc_lo
+        0xBF88_0003, // s_cbranch_execz over the body
+        0xBE95_0314, // s_mov_b32 s21, s20 (parked)
+        0xBE94_0387, // s_mov_b32 s20, 7 (the register reused)
+        0xBE94_0315, // s_mov_b32 s20, s21 (moved back)
+        0xBEFE_030D, // s_mov_b32 exec_lo, s13
+        0x7E00_0214, // v_mov_b32 v0, s20
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native_of(&words, false, 32);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // (lanes in the mask, s1, lanes inside the branch) -> what every lane stores
+    for (below, other, inside, expected) in [
+        (32u32, 0u32, 32u32, u32::MAX),
+        (10, 0, 4, 0x3FF),
+        (10, 0, 0, 0x3FF),
+        (0, 0, 5, 0),
+        (10, 1, 4, 5),
+    ] {
+        let Some(got) = on_the_card(&shader, [below, other, inside]) else {
+            return;
+        };
+        assert_eq!(
+            got, expected,
+            "{below} lanes in the mask, s1 = {other}, {inside} lanes inside"
+        );
+    }
+    eprintln!("ran on the hardware device: the parked mask's bits after the join, or the number");
 }
 
 /// A 32-lane console wave. `if (t < s0) { ... SCC = (s1 == 7) }` and a branch on SCC after
