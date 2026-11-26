@@ -67,6 +67,10 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Its part in the stand-in for the indirect light, by its name in the
+    /// container ([`Shader::ambient`]).
+    #[cfg(windows)]
+    ambient: OnceLock<Option<crate::ambient::Role>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +123,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+        ambient: OnceLock::new(),
             })
         })
         .clone()
@@ -138,6 +143,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         container: container.to_vec(),
         translated: OnceLock::new(),
         walks: OnceLock::new(),
+        ambient: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
@@ -296,6 +302,12 @@ impl Shader {
     /// at once, when a dispatch first asks.
     fn walks(&self) -> bool {
         *self.walks.get_or_init(|| container_walks(&self.container))
+    }
+
+    /// The program's part in the stand-in for the indirect light
+    /// (`crate::ambient`), compute programs only. Looked at once.
+    pub(crate) fn ambient(&self) -> Option<crate::ambient::Role> {
+        *self.ambient.get_or_init(|| (self.stage == "compute").then(|| crate::ambient::role(&self.container)).flatten())
     }
 }
 
