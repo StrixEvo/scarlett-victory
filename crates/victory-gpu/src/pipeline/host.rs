@@ -207,6 +207,38 @@ impl GraphicsState {
         )
     }
 
+    /// The blend state for the host: the title's, with blending off for
+    /// each target of an integer format. The host refuses a pipeline that
+    /// blends such a target (`E_INVALIDARG`; debug layer message 676), and
+    /// an integer target cannot be blended, so its writes go in as they
+    /// are. With one blend for all targets
+    /// (`IndependentBlendEnable` false), target 0's is copied to every
+    /// slot first, so only the integer ones change.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |n: usize| integer_format(self.targets.RTFormats[n]);
+        let mut blend = self.blend;
+        let enabled = |blend: &D3D12_BLEND_DESC, n: usize| {
+            let n = if blend.IndependentBlendEnable.as_bool() {
+                n
+            } else {
+                0
+            };
+            blend.RenderTarget[n].BlendEnable.as_bool()
+        };
+        if !(0..count).any(|n| integer(n) && enabled(&blend, n)) {
+            return blend;
+        }
+        if !blend.IndependentBlendEnable.as_bool() {
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for n in (0..count).filter(|&n| integer(n)) {
+            blend.RenderTarget[n].BlendEnable = false.into();
+        }
+        blend
+    }
+
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
         let d = &self.depth;
         D3D12_DEPTH_STENCIL_DESC1 {
@@ -634,7 +666,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -881,7 +913,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -900,7 +932,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -916,6 +948,35 @@ fn mesh_pipeline(
     } else {
         build(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth))
     }
+}
+
+/// Whether a render target format holds integers (`_UINT` or `_SINT`),
+/// which cannot be blended.
+fn integer_format(f: DXGI_FORMAT) -> bool {
+    matches!(
+        f,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
 }
 
 /// The bytes of shader code (none for an absent stage).
@@ -1058,6 +1119,84 @@ mod tests {
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+
+    /// A title's blend state can enable blending for every target, an
+    /// integer one too (run19: `R8_UINT` at slot 2). The host refuses
+    /// such a pipeline (`E_INVALIDARG`, debug layer message 676); with
+    /// blending off for the integer target it is made.
+    #[test]
+    fn blending_on_an_integer_target_does_not_refuse_the_mesh_pipeline() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !host.mesh_shaders() {
+            eprintln!("no host mesh shader support; skipped");
+            return;
+        }
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(
+            &dxc,
+            dir.path(),
+            "struct O { float4 c : SV_Target0; uint id : SV_Target1; };
+            O main() { O o; o.c = 1; o.id = 7; return o; }",
+            "ps_6_5",
+        );
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        g.depth.DepthEnable = false.into();
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        // One blend for all targets, as the title gave it.
+        g.blend.IndependentBlendEnable = false.into();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        g.blend.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        let name = super::super::library::name(
+            "mesh integer target test",
+            &root_blob,
+            &[&ms, &ps],
+            &g.describe(),
+        );
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name)
+            .expect("blending on the integer target refused the pipeline");
+    }
+
+    /// Blending stays on for the targets that can blend, as the title set
+    /// it, and goes off for the integer ones only.
+    #[test]
+    fn host_blend_turns_blending_off_for_integer_targets_only() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R16G16_FLOAT;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        g.blend.IndependentBlendEnable = false.into();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+
+        let b = g.host_blend();
+        assert!(b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+        assert!(b.RenderTarget[1].BlendEnable.as_bool());
+        assert_eq!(b.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA);
+        assert!(!b.RenderTarget[2].BlendEnable.as_bool());
+        // The rest of slot 2's state (its write mask) is kept.
+        assert_eq!(
+            b.RenderTarget[2].RenderTargetWriteMask,
+            b.RenderTarget[0].RenderTargetWriteMask
+        );
+
+        // Nothing to change: the title's blend state is used as it is.
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let same = g.host_blend();
+        assert!(!same.IndependentBlendEnable.as_bool());
     }
 
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
