@@ -206,6 +206,22 @@ fn module_of(at: usize) -> (String, usize) {
     (file, at - module as usize)
 }
 
+/// Whether `at` is committed memory that can be read (or written, with
+/// `write`) now.
+fn accessible(at: usize, write: bool) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_NOACCESS,
+        PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    let readable = info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0;
+    let writable = info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0;
+    n != 0 && info.State == MEM_COMMIT && readable && (!write || writable)
+}
+
 /// Registers the handler, once, ahead of the others: it takes only faults
 /// inside guarded textures.
 fn install() {
@@ -221,6 +237,7 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let (kind, address) = (r.ExceptionInformation[0], r.ExceptionInformation[1]);
+        const WRITE: usize = 1;
         let mut s = state();
         let Some((&start, range)) = s.ranges.range_mut(..=address).next_back() else {
             return EXCEPTION_CONTINUE_SEARCH;
@@ -229,14 +246,19 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let Some(old) = range.armed.take() else {
-            // Not ours to give back (opened meanwhile, or some other guard).
-            return EXCEPTION_CONTINUE_SEARCH;
+            // Another thread faulted on these pages at the same time and gave
+            // them back first: try again (run 29 crashed the title here).
+            // Pages still inaccessible are some other guard's.
+            return if accessible(address, kind == WRITE) {
+                EXCEPTION_CONTINUE_EXECUTION
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            };
         };
         let end = range.end;
         if protect(start, end, old).is_none() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        const WRITE: usize = 1;
         s.accesses.push(Access {
             start,
             write: kind == WRITE,
@@ -270,8 +292,12 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
 
+    /// The tests share the watched textures: one at a time.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_read_and_a_write_of_a_guarded_texture_are_noted_and_go_on() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: setting the switch before anything reads it in this process.
         unsafe { std::env::set_var("VICTORY_WATCH_GPU_TEXTURES", "1") };
         assert!(on());
@@ -312,6 +338,53 @@ mod tests {
         // SAFETY: as above.
         unsafe { std::ptr::read_volatile(base as *const u32) };
         assert!(pending().is_empty());
+        // SAFETY: our own allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Threads reading the same guarded pages at once while frames guard
+    /// them again: each fault is either taken or retried, none reaches the
+    /// title's crash handler (run 29: the second of two threads did).
+    #[test]
+    fn threads_faulting_on_one_texture_at_once_all_go_on() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: as above.
+        unsafe { std::env::set_var("VICTORY_WATCH_GPU_TEXTURES", "1") };
+        const LEN: usize = 2 * PAGE;
+        // SAFETY: fresh memory of our own.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        watch(base, LEN, "test 32x32 f16".to_owned());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut sum = 0u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        // SAFETY: our memory; the guard is taken by the handler.
+                        sum += u64::from(unsafe { std::ptr::read_volatile(base as *const u32) });
+                    }
+                    sum
+                })
+            })
+            .collect();
+        for f in 10..2010 {
+            frame(f);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        forget(base, LEN);
+        frame(3000);
         // SAFETY: our own allocation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
