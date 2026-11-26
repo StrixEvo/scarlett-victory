@@ -336,7 +336,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
     let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
-        let state = list.legal(texture, COPY_SOURCE);
+        let state = crate::host::legal_state(texture, COPY_SOURCE);
         let barrier = crate::host::transition(
             texture,
             D3D12_RESOURCE_STATES(before as i32),
