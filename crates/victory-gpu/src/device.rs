@@ -369,6 +369,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    #[cfg(windows)]
+    dump_unknown_pipeline(SLOT, calls, desc);
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.
@@ -388,15 +390,85 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // What each of the description's other words points at, for those
+        // that are readable addresses: its index, then its first 64 bytes as
+        // hex, so the (address, size) pairs it seems to hold can be told
+        // apart (shader code, names, state).
+        #[cfg(windows)]
+        let pointed: Vec<String> = description
+            .iter()
+            .flatten()
+            .enumerate()
+            .skip(1)
+            .filter(|&(_, &w)| w >= 0x1_0000)
+            .filter_map(|(n, &w)| {
+                let mut bytes = [0u8; 64];
+                crate::host::read_into(w as *const u8, &mut bytes).then(|| {
+                    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                    format!("{n}:{hex}")
+                })
+            })
+            .collect();
+        #[cfg(not(windows))]
+        let pointed: Vec<String> = Vec::new();
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
+            pointed = format_args!("{pointed:?}"),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
     E_NOTIMPL
+}
+
+/// With `VICTORY_SHADER_SAVE=<dir>`: the first 64 calls of each unknown pipeline method
+/// written to `<dir>/x218` (or `x1c8`) whole, to work out their layout. Per call `c`: the
+/// 128-byte description (`c<c>-desc.bin`), each word followed by a size of 1 byte to 1 MiB
+/// read as that many bytes (`c<c>-w<n>-<size>.bin`: the (address, size) pairs), and each
+/// other readable address as 512 bytes (`c<c>-w<n>-ptr.bin`).
+#[cfg(windows)]
+fn dump_unknown_pipeline(slot: usize, call: u32, desc: *const u8) {
+    if call > 64 {
+        return;
+    }
+    let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir).join(format!("x{slot:x}"));
+    let _ = std::fs::create_dir_all(&dir);
+    let read = |at: u64, len: usize| -> Option<Vec<u8>> {
+        let mut bytes = vec![0u8; len];
+        (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then_some(bytes)
+    };
+    let Some(head) = read(desc as u64, 128) else {
+        return;
+    };
+    let _ = std::fs::write(dir.join(format!("c{call}-desc.bin")), &head);
+    let words: Vec<u64> = head
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect();
+    let mut n = 0;
+    while n < words.len() {
+        let (w, next) = (words[n], words.get(n + 1).copied().unwrap_or(0));
+        if w >= 0x1_0000 {
+            if (1..=0x10_0000).contains(&next)
+                && let Some(bytes) = read(w, next as usize)
+            {
+                let _ = std::fs::write(dir.join(format!("c{call}-w{n}-{next:x}.bin")), bytes);
+                n += 2;
+                continue;
+            }
+            if let Some(bytes) = read(w, 512) {
+                let _ = std::fs::write(dir.join(format!("c{call}-w{n}-ptr.bin")), bytes);
+            }
+        }
+        n += 1;
+    }
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the

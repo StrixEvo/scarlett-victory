@@ -47,7 +47,39 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || asked(n)
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// F9 pressed (with a capture folder, diagnostics builds): the next whole frame is captured
+/// like a listed one, its targets saved and its draws written to `frame-<n>-ops.txt`, for
+/// a picture on the screen whose frame number is not known before.
+fn asked(n: u64) -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    if !cfg!(feature = "diagnostics") || folder().is_none() {
+        return false;
+    }
+    static ASKED: AtomicU64 = AtomicU64::new(u64::MAX);
+    static POLLED: AtomicU64 = AtomicU64::new(u64::MAX);
+    static DOWN: AtomicBool = AtomicBool::new(false);
+    // The key is looked at once per frame number asked about.
+    if POLLED.swap(n, Ordering::Relaxed) != n {
+        // SAFETY: a plain query of the key's state.
+        let down = unsafe {
+            windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
+                windows::Win32::UI::Input::KeyboardAndMouse::VK_F9.0.into(),
+            )
+        } < 0;
+        if down && !DOWN.swap(true, Ordering::Relaxed) {
+            // `n` is the frame being recorded: the one after it is recorded whole.
+            ASKED.store(n + 1, Ordering::Relaxed);
+            tracing::info!(frame = n + 1, "F9: this frame is captured");
+        } else if !down {
+            DOWN.store(false, Ordering::Relaxed);
+        }
+    }
+    ASKED.load(Ordering::Relaxed) == n
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to

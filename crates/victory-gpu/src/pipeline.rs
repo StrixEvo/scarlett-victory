@@ -470,6 +470,12 @@ pub(crate) fn is_skipped(this: This) -> bool {
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_drop(this: This) {
+    note_drop_because(this, None);
+}
+
+/// As [`note_drop`], with why binding failed when the host pipeline was made (`failed`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_drop_because(this: This, failed: Option<&str>) {
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
     } else {
@@ -477,6 +483,14 @@ pub(crate) fn note_drop(this: This) {
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
             .or_else(|| make::missing(&p.host))
+            // Made, and still not run: binding it or the buffers it reads failed.
+            .or_else(|| {
+                Some(format!(
+                    "made, not bound ({}) {:?}",
+                    failed.unwrap_or("no reason noted"),
+                    p.shaders
+                ))
+            })
     };
     if let Some(why) = why {
         note_why(why);

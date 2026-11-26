@@ -437,10 +437,22 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
-    crate::pipeline::note_drop(pipeline as This);
+    crate::pipeline::note_drop_because(pipeline as This, BIND_FAIL.take());
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
+}
+
+thread_local! {
+    /// Why the last draw or dispatch of this thread could not be bound ([`failed`]), for the
+    /// count of drops by reason (diagnostics).
+    static BIND_FAIL: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// False, noting `why` for the drop it makes.
+fn failed(why: &'static str) -> bool {
+    BIND_FAIL.set(Some(why));
+    false
 }
 
 /// Dispatches run on the host so far.
@@ -858,7 +870,7 @@ impl State {
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return failed("a pipeline of another kind");
         }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
@@ -898,7 +910,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                return false;
+                return failed("an index buffer with no host copy");
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -944,6 +956,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        BIND_FAIL.set(None);
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1004,7 +1017,7 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
+                return failed("a descriptor table found no free slots");
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -1014,7 +1027,7 @@ impl State {
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
-                    return false;
+                    return failed("title memory by address without a view heap");
                 };
                 Some(ready)
             } else {
@@ -1085,7 +1098,7 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
-                            return false;
+                            return failed("a root view the title did not set, no null table");
                         }
                         continue;
                     };
@@ -1097,7 +1110,7 @@ impl State {
                         });
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
-                            return false;
+                            return failed("a root view's table could not be made");
                         }
                         continue;
                     }
@@ -1148,7 +1161,7 @@ impl State {
                     }
                 };
                 if !self.root_uav(list, address, param, compute, writes) {
-                    return false;
+                    return failed("a root UAV could not be given");
                 }
             }
         }
@@ -2077,6 +2090,8 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop_because(self.pipeline as This, BIND_FAIL.take());
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -2815,7 +2830,7 @@ impl State {
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
-                return false;
+                return failed("rectangle vertices outside their buffer");
             }
             let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
                 return false;
