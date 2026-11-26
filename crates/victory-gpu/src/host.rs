@@ -39,6 +39,33 @@ const RTV_RING: u32 = 1024;
 /// Whether the host device has GPU upload heaps (asked when it is made).
 static GPU_UPLOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Upload buffers put in the card's memory through the resizable BAR
+/// (`VICTORY_REBAR_UPLOAD`): 0 none (the default), 1 those shaders read
+/// in place ([`Host::shader_upload_buffer`]), 2 (`all`) every one of up
+/// to [`REBAR_UPLOAD_MOST`] bytes ([`Host::upload_buffer`]).
+fn rebar_upload() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        let level = match std::env::var("VICTORY_REBAR_UPLOAD").ok().as_deref().map(str::trim) {
+            Some("1") => 1,
+            Some("all" | "2") => 2,
+            _ => 0,
+        };
+        tracing::info!(
+            level,
+            "upload buffers in the card's memory through the resizable BAR (VICTORY_REBAR_UPLOAD: 0 none, 1 those shaders read in place, all every one of up to 32 MiB)"
+        );
+        level
+    })
+}
+
+/// The largest upload buffer [`rebar_upload`] puts in the card's memory.
+const REBAR_UPLOAD_MOST: u64 = 32 << 20;
+
+/// Upload buffers made in the card's memory by [`rebar_upload`]: how
+/// many, and their bytes.
+pub(crate) static REBAR_MADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -1907,7 +1934,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    let (buffer, data) = host.shader_upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -7753,7 +7780,7 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            let (buffer, data) = host.shader_upload_buffer(len)?;
             name_frame(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -8772,7 +8799,36 @@ impl Host {
         }
     }
 
+    /// An upload buffer whose bytes shaders read where they are (list
+    /// scratch: constants, root data, element strides): with
+    /// `VICTORY_REBAR_UPLOAD=1` or `all` it goes in the card's own memory
+    /// through the resizable BAR ([`Host::gpu_upload_buffer`]), so shaders
+    /// read it from VRAM, not across the bus each time; else, or where that
+    /// heap turns it down, the usual upload buffer.
+    pub(crate) fn shader_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if rebar_upload() >= 1
+            && size <= REBAR_UPLOAD_MOST
+            && let Some(made) = self.gpu_upload_buffer(size)
+        {
+            REBAR_MADE[0].fetch_add(1, Ordering::Relaxed);
+            REBAR_MADE[1].fetch_add(size, Ordering::Relaxed);
+            return Some(made);
+        }
+        self.upload_buffer(size)
+    }
+
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        // `VICTORY_REBAR_UPLOAD=all`: every upload buffer of up to 32 MiB
+        // in the card's memory (texture staging and copy sources too), as
+        // rodrion-vi does; costs VRAM, which a 12 GB card is short of.
+        if rebar_upload() >= 2
+            && size <= REBAR_UPLOAD_MOST
+            && let Some(made) = self.gpu_upload_buffer(size)
+        {
+            REBAR_MADE[0].fetch_add(1, Ordering::Relaxed);
+            REBAR_MADE[1].fetch_add(size, Ordering::Relaxed);
+            return Some(made);
+        }
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
