@@ -42,6 +42,7 @@ about 6 fps.
 | The boat | the cause of the sinking is found (see Findings); the fix (`VICTORY_TEXTURE_BACK=1`) is in, not yet checked in game |
 | Async compute | `VICTORY_ASYNC_COMPUTE=1` runs the title's compute queue on the card's compute engine: 5.3 to 5.6 fps against 4.5 in the prison cell (185 against 220 ms a frame), debug layer clean |
 | Lock and copy switches | `VICTORY_HEAP_LOCKS=1` with `VICTORY_COPY_PLAIN=1` and `VICTORY_FILLS_PLAIN=1`: 164.6 against about 174 ms a frame in the prison cell (6.1 fps). Tested and slower or no gain: `VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`, `VICTORY_WINDOW_KB=1024`, `VICTORY_HEAP_SYNC_CUT` |
+| Upstream merge (`f7ced96`) | fxceless main merged (48 commits). With `VICTORY_PIPELINE_COMPUTE_WAIT` off (now the default here) the prison cell runs at **150.8 ms a frame, 6.6 fps** (merge5_waitoff); with it on the title's hang watchdog ended the run at the end of loading |
 | Faces, some foliage and bridges | sometimes without their texture: the 12 GB card runs out of texture room |
 | Stability | runs of 5 to 30 minutes end normally; no device loss in the latest runs |
 
@@ -58,6 +59,7 @@ $env:VICTORY_ASYNC_COMPUTE = '1'    # the title's compute queue on the card's co
 $env:VICTORY_HEAP_LOCKS = '1'       # heap slots already made are found without the slots' lock
 $env:VICTORY_COPY_PLAIN = '1'       # plain copies of title memory
 $env:VICTORY_FILLS_PLAIN = '1'      # plain fills
+$env:VICTORY_BVH_BUILDER = '0'      # upstream turns the structure builder on; it drops fps to 0.2-3
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
