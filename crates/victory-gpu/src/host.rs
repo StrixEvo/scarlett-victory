@@ -1137,6 +1137,9 @@ mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// A COMPUTE list (the host side of a title compute list with
+    /// `crate::compute`), run on the host compute queue; otherwise DIRECT.
+    pub(crate) compute: bool,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -2145,6 +2148,9 @@ struct CardWork {
     /// After them, in the same submission: the compare of the declared
     /// ranges with their bytes from before. As `sync`.
     check: Vec<Prelude>,
+    /// The same as COMPUTE lists, for submissions of the title's compute
+    /// lists on the host compute queue (`crate::compute`).
+    check_compute: Vec<Prelude>,
     /// After it ran: the pieces that differ come down.
     fetch: Prelude,
     root: ID3D12RootSignature,
@@ -4717,11 +4723,17 @@ impl Host {
 
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+        self.new_list_of(false)
+    }
+
+    /// A new list, open for recording: a COMPUTE list if `compute`
+    /// (`crate::compute`), else DIRECT.
+    pub(crate) fn new_list_of(&self, compute: bool) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let before = private_bytes();
-        let list = self.make_list();
+        let list = self.make_list(compute);
         LISTS[0].fetch_add(1, Ordering::Relaxed);
         // (May shrink while a list is made, on another thread's account:
         // added as it is, the sum is what counts.)
@@ -4738,14 +4750,19 @@ impl Host {
 
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
+        self.make_prelude_of(D3D12_COMMAND_LIST_TYPE_DIRECT)
+    }
+
+    /// [`Host::make_prelude`] of a list type (DIRECT or COMPUTE).
+    fn make_prelude_of(&self, kind: D3D12_COMMAND_LIST_TYPE) -> Option<Prelude> {
         // SAFETY: plain object creation.
         let made: windows::core::Result<Prelude> = unsafe {
             (|| {
                 let allocator: ID3D12CommandAllocator =
-                    self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    self.device.CreateCommandAllocator(kind)?;
                 let list: ID3D12GraphicsCommandList =
                     self.device
-                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                        .CreateCommandList(0, kind, &allocator, None)?;
                 list.Close()?;
                 Ok((allocator, list))
             })()
@@ -4760,15 +4777,16 @@ impl Host {
         }
     }
 
-    fn make_list(&self) -> windows::core::Result<HostList> {
+    fn make_list(&self, compute: bool) -> windows::core::Result<HostList> {
+        let kind = if compute { D3D12_COMMAND_LIST_TYPE_COMPUTE } else { D3D12_COMMAND_LIST_TYPE_DIRECT };
         // SAFETY: plain object creation.
         unsafe {
             let allocator: ID3D12CommandAllocator = self
                 .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                .CreateCommandAllocator(kind)?;
             let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
                 0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                kind,
                 &allocator,
                 None,
             )?;
@@ -4779,6 +4797,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 list,
+                compute,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -4909,6 +4928,7 @@ impl Host {
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
+                check_compute: Vec::new(),
                 fetch: list()?,
                 root,
                 pso,
@@ -5017,6 +5037,9 @@ impl Host {
     /// before. So the copies change exactly when they did on one queue; what
     /// leaves the direct queue is the crossing from the PC's memory.
     fn card_before(&self, runs: &[&HostList], flown: bool, sent: u64) -> Option<CardPlan> {
+        // The compare runs behind the lists, on their queue: a COMPUTE
+        // list when they go to the host compute queue.
+        let compute = !runs.is_empty() && runs.iter().all(|l| l.compute);
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -5287,7 +5310,9 @@ impl Host {
         }
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
-            let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
+            let pooled = if compute { work.check_compute.pop() } else { work.check.pop() };
+            let kind = if compute { D3D12_COMMAND_LIST_TYPE_COMPUTE } else { D3D12_COMMAND_LIST_TYPE_DIRECT };
+            let Some(check) = pooled.or_else(|| self.make_prelude_of(kind)) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
             let (allocator, list) = &check;
@@ -5398,7 +5423,15 @@ impl Host {
             return;
         };
         for (check, list) in plan.lists {
-            if check { work.check.push(list) } else { work.sync.push(list) }
+            // SAFETY: a plain query.
+            let compute = unsafe { list.1.GetType() } == D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            if check && compute {
+                work.check_compute.push(list)
+            } else if check {
+                work.check.push(list)
+            } else {
+                work.sync.push(list)
+            }
         }
         work.out = work.out.saturating_sub(1);
         // With the relay other plans may be on the card, their results
@@ -6014,6 +6047,9 @@ impl Host {
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
+                    if let Some(c) = crate::compute::made() {
+                        c.before_signal(&self.queue, &self.fence, *submitted);
+                    }
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
@@ -6358,6 +6394,31 @@ impl Host {
         working(was_working);
     }
 
+    /// Sends a submission's `lists` (each on the queue `kinds` names,
+    /// `crate::compute`) and signals `value` on the submission fence
+    /// behind them. Without the host compute queue: the direct queue's
+    /// execute and signal, as before.
+    ///
+    /// # Safety
+    /// Closed lists of the types `kinds` names; under the submission lock.
+    unsafe fn send_lists(
+        &self,
+        lists: &[Option<ID3D12CommandList>],
+        kinds: &[crate::compute::On],
+        value: u64,
+    ) -> windows::core::Result<()> {
+        if let Some(c) = crate::compute::made() {
+            let paired: Vec<(crate::compute::On, Option<ID3D12CommandList>)> =
+                kinds.iter().copied().zip(lists.iter().cloned()).collect();
+            return c.send(&self.queue, &self.fence, &paired, value);
+        }
+        // SAFETY: as the caller says.
+        unsafe {
+            self.queue.ExecuteCommandLists(lists);
+            self.queue.Signal(&self.fence, value)
+        }
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -6465,13 +6526,19 @@ impl Host {
             settled += settling.elapsed();
         }
         part = prep_part(0, part);
+        // The queue each of `lists` runs on (`crate::compute`): a prelude
+        // is a DIRECT list whatever list it comes before.
+        let mut kinds: Vec<crate::compute::On> = Vec::with_capacity(2 * runs.len());
+        let on = |l: &HostList| if l.compute { crate::compute::On::Compute } else { crate::compute::On::Direct };
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
+                kinds.push(crate::compute::On::Direct);
             }
             lists.push(list.list.cast().ok());
+            kinds.push(on(list));
         }
         part = prep_part(1, part);
         batch.flush();
@@ -6497,19 +6564,27 @@ impl Host {
             settled += settling.elapsed();
         }
         part = prep_part(3, part);
+        // Mode 1 of `crate::compute`: nothing of ours goes to the direct
+        // queue beside the compute queue's work (the card copies' sends
+        // below write the copies).
+        if let Some(c) = crate::compute::made() {
+            c.before_direct(&self.queue, &self.fence);
+        }
         let card = self.card_before(runs, flown, *submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+            // SAFETY: a plain query.
+            let compute = check
+                .cast::<ID3D12GraphicsCommandList>()
+                .is_ok_and(|l| unsafe { l.GetType() } == D3D12_COMMAND_LIST_TYPE_COMPUTE);
             lists.push(Some(check));
+            kinds.push(if compute { crate::compute::On::Compute } else { crate::compute::On::Direct });
         }
         prep_part(4, part);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
-                self.queue.Signal(&self.fence, *submitted)
-            };
+            let signalled = unsafe { self.send_lists(&lists, &kinds, *submitted) };
             self.card_sent();
             prep_part(5, prepared);
             if let Err(e) = signalled {
@@ -6537,29 +6612,26 @@ impl Host {
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let groups: Vec<(&[Option<ID3D12CommandList>], &[crate::compute::On])> = if timing() {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
+                .map(|(&a, &b)| (&lists[a..b], &kinds[a..b]))
                 .collect()
         } else {
-            vec![&lists[..]]
+            vec![(&lists[..], &kinds[..])]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups = [(&lists[..], &kinds[..])];
         submitting(2, runs.len());
-        for (i, group) in groups.iter().enumerate() {
+        for (i, (group, group_kinds)) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                let sent = self.send_lists(group, group_kinds, *submitted);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                let waited = sent.and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
                         working(false);
@@ -7223,6 +7295,15 @@ impl HostList {
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
     /// the texture there at submission.
+    /// [`legal_state`] in this list: on a COMPUTE list (`crate::compute`)
+    /// also only the states a compute list may name ([`compute_state`]).
+    /// Every barrier the list records takes its state from here, so the
+    /// states it tracks and those it names agree.
+    pub(crate) fn legal(&self, texture: &ID3D12Resource, state: u32) -> u32 {
+        let state = legal_state(texture, state);
+        if self.compute { compute_state(state) } else { state }
+    }
+
     pub(crate) fn transition(
         &self,
         resource: crate::object::This,
@@ -7230,7 +7311,7 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        let wanted = self.legal(texture, wanted);
         // A frame shot names its pictures after the title's textures.
         #[cfg(feature = "diagnostics")]
         if crate::shot::recording() {
@@ -7264,7 +7345,7 @@ impl HostList {
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
-        let wanted = legal_state(&copy.texture, wanted);
+        let wanted = self.legal(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -9347,6 +9428,8 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            crate::queue::log_compute(frames);
+            crate::compute::line(frames);
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -9727,6 +9810,21 @@ fn title_window() -> Option<HWND> {
 pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     // SAFETY: a plain query.
     legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
+}
+
+/// A host state as a COMPUTE list may name it: pixel-shader reads become
+/// non-pixel-shader reads, and the states only the direct queue knows
+/// (render target, depth, resolve, ...) go. The list's prelude, a DIRECT
+/// list, moves the texture from its real state to what remains.
+pub(crate) fn compute_state(state: u32) -> u32 {
+    const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+    const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+    // Vertex and constant buffer, unordered access, non-pixel-shader
+    // resource, indirect argument, copy destination and source, ray-tracing
+    // acceleration structure.
+    const COMPUTE_STATES: u32 = 0x1 | 0x8 | 0x40 | 0x200 | 0x400 | 0x800 | 0x40_0000;
+    let state = if state & PIXEL_SHADER_RESOURCE != 0 { state | NON_PIXEL_SHADER_RESOURCE } else { state };
+    state & COMPUTE_STATES
 }
 
 /// [`legal_state`] for a texture with resource flags `flags`.

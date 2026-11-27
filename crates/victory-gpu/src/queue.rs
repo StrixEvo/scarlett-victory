@@ -1042,6 +1042,48 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
+/// The title's compute queue (kind 2) per frame line: submissions, lists,
+/// draws and indirect executions, dispatches, submissions held for a memory
+/// value; then the same for every other queue together (lists, dispatches).
+static COMPUTE_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+fn count_submission(kind: u32, lists: &[This]) {
+    let (mut draws, mut dispatches, mut types) = (0u64, 0u64, 0u32);
+    for &l in lists {
+        let (t, d, x) = crate::list::work(l);
+        draws += u64::from(d);
+        dispatches += u64::from(x);
+        types |= 1 << t.min(31);
+    }
+    let add = |i: usize, n: u64| COMPUTE_STATS[i].fetch_add(n, Ordering::Relaxed);
+    if kind == 2 {
+        add(0, 1);
+        add(1, lists.len() as u64);
+        add(2, draws);
+        add(3, dispatches);
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        if SEEN.fetch_add(1, Ordering::Relaxed) < 4 {
+            tracing::info!(lists = lists.len(), draws, dispatches, list_types = types, "a submission on the title's compute queue");
+        }
+    } else {
+        add(5, lists.len() as u64);
+        add(6, dispatches);
+    }
+}
+
+/// Logs [`COMPUTE_STATS`] per frame over `frames` frames and resets them.
+#[cfg(windows)]
+pub(crate) fn log_compute(frames: f64) {
+    let c: Vec<f64> = COMPUTE_STATS
+        .iter()
+        .map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0))
+        .collect();
+    tracing::info!(
+        "the title's compute queue per frame: {:.1} submissions, {:.1} lists, {:.1} dispatches, {:.1} draws or indirect executions, {:.1} submissions held for a memory value; the other queues: {:.1} lists, {:.1} dispatches",
+        c[0], c[1], c[3], c[2], c[4], c[5], c[6]
+    );
+}
+
 fn execute_now(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
@@ -1050,6 +1092,9 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if !this.is_null() {
+            count_submission(queue(this).kind, lists);
+        }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -1066,6 +1111,9 @@ fn execute_now(this: This, count: u32, lists: *const This) {
                 static SEEN: AtomicU64 = AtomicU64::new(0);
                 if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
                     tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
+                }
+                if queue(this).kind == 2 {
+                    COMPUTE_STATS[4].fetch_add(1, Ordering::Relaxed);
                 }
                 lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
                 let mut waiting = lock(&WAITING);

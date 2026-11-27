@@ -127,6 +127,9 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// Draws (indirect executions among them) and dispatches recorded since
+    /// the list's last reset, for the compute queue's line ([`work`]).
+    work: [std::sync::atomic::AtomicU32; 2],
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -245,6 +248,23 @@ unsafe impl Send for Idle {}
 /// made 21.2 ms" a frame, and the graphics kernel's time to free them).
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+/// The same for COMPUTE host lists (`crate::compute`).
+#[cfg(windows)]
+static IDLE_COMPUTE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
+
+/// The pool of idle host lists of a type (COMPUTE if `compute`).
+#[cfg(windows)]
+fn idle_pool(compute: bool) -> &'static std::sync::Mutex<(Vec<Idle>, u64)> {
+    if compute { &IDLE_COMPUTE } else { &IDLE }
+}
+
+/// Whether the title list `this` records into a COMPUTE host list: a
+/// compute list (type 2) with `crate::compute` on.
+#[cfg(windows)]
+fn wants_compute(this: This) -> bool {
+    // SAFETY: the title passes one of our lists.
+    is_list(this) && unsafe { (*this.cast::<List>()).kind } == 2 && crate::compute::on()
+}
 
 /// The most host lists kept idle, and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
@@ -268,9 +288,9 @@ fn pools() -> bool {
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
-pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
+pub(crate) fn fresh_list(compute: bool) -> Option<crate::host::HostList> {
     let idle = {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut idle = idle_pool(compute).lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
         if let Some(Idle(_, bytes)) = &taken {
             idle.1 -= bytes;
@@ -279,7 +299,7 @@ pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
     };
     match idle {
         Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        None => crate::host::host().and_then(|h| h.new_list_of(compute).ok()),
     }
 }
 
@@ -296,14 +316,15 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        let pool = idle_pool(host.compute);
+        if !ran.contains(&i) || pool.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
         let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut idle = pool.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
@@ -343,7 +364,7 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     }
-    let Some(fresh) = fresh_list() else {
+    let Some(fresh) = fresh_list(wants_compute(this)) else {
         // shortcut: without a new host list the wait stands before the part
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -420,7 +441,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        let Some(fresh) = fresh_list(wants_compute(this)) else {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
@@ -492,7 +513,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        let Some(fresh) = fresh_list(wants_compute(this)) else {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
@@ -605,7 +626,7 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
+        host: crate::host::host().and_then(|h| match h.new_list_of(kind == 2 && crate::compute::on()) {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -622,6 +643,7 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        work: Default::default(),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -670,6 +692,10 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // SAFETY: as above.
+    for w in unsafe { &(*this.cast::<List>()).work } {
+        w.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
     // The parts of a recording that was cut and never submitted go with it
     // (a submission takes the parts it runs).
     #[cfg(windows)]
@@ -725,7 +751,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                last: u64::from(list.legal(texture, wanted)),
             })
         }
         1 => Some(Barrier {
@@ -813,7 +839,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
+        let state = list.legal(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
@@ -1408,7 +1434,7 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     #[cfg(not(windows))]
     {
         let _ = (this, x, y, z);
-        count_dispatch();
+        count_dispatch(this);
     }
 }
 
@@ -1659,19 +1685,19 @@ mod state {
         first: u32,
         first_instance: u32,
     ) {
-        super::count_draw();
+        super::count_draw(this);
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
-        super::count_dispatch();
+        super::count_dispatch(this);
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
-        super::count_draw();
+        super::count_draw(this);
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
@@ -1688,7 +1714,7 @@ mod state {
         indirect: u64,
         _payload: u64,
     ) {
-        super::count_draw();
+        super::count_draw(this);
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
@@ -1704,7 +1730,7 @@ mod state {
         base: i32,
         first_instance: u32,
     ) {
-        super::count_draw();
+        super::count_draw(this);
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -1739,16 +1765,37 @@ mod state {
     pub(super) use super::ignored_state as viewports;
 }
 
-fn count_draw() {
+fn count_draw(this: This) {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    count_on(this, 0);
+}
+
+/// Counts a draw (0) or dispatch (1) on the list `this` itself.
+fn count_on(this: This, which: usize) {
+    if is_list(this) {
+        // SAFETY: one of our lists.
+        unsafe { &(*this.cast::<List>()).work[which] }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The list's type (0 direct, 2 compute, 3 copy) and the draws and
+/// dispatches recorded into it since its last reset.
+pub(crate) fn work(this: This) -> (u32, u32, u32) {
+    if !is_list(this) {
+        return (u32::MAX, 0, 0);
+    }
+    // SAFETY: one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let r = |i: usize| list.work[i].load(std::sync::atomic::Ordering::Relaxed);
+    (list.kind, r(0), r(1))
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
 /// dispatches, counted per frame for the log.
 /// shortcut: dropped until their shaders translate (decision 0007).
 #[cfg(not(windows))]
-extern "system" fn draw(_: This) {
-    count_draw();
+extern "system" fn draw(this: This) {
+    count_draw(this);
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
@@ -1769,7 +1816,7 @@ extern "system" fn execute_indirect(
     count: This,
     count_offset: u64,
 ) {
-    count_draw();
+    count_draw(this);
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
@@ -1818,12 +1865,13 @@ pub(crate) fn take_indirect() -> u64 {
     INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-fn count_dispatch() {
+fn count_dispatch(this: This) {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    count_on(this, 1);
 }
 #[cfg(not(windows))]
-extern "system" fn dispatch(_: This) {
-    count_dispatch();
+extern "system" fn dispatch(this: This) {
+    count_dispatch(this);
 }
 static DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2095,7 +2143,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(current) = list.host.as_ref() else {
             return;
         };
-        let Some(fresh) = fresh_list() else {
+        let Some(fresh) = fresh_list(wants_compute(this)) else {
             return;
         };
         current.close();

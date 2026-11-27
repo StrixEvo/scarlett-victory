@@ -46,6 +46,8 @@ mod draw;
 pub mod external;
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod compute;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;

@@ -128,7 +128,7 @@ impl Batch {
     /// The open upload list.
     pub(crate) fn list(&mut self) -> Option<&HostList> {
         if self.list.is_none() {
-            self.list = crate::list::fresh_list();
+            self.list = crate::list::fresh_list(false);
             self.began = std::time::Instant::now();
         }
         self.list.as_ref()
