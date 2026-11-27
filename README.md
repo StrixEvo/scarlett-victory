@@ -41,6 +41,7 @@ about 6 fps.
 | Indoor light | the ray-traced indirect light does not run (`VICTORY_BVH_BUILDER=1` crashes the title: it reads structure sizes before they land). A stand-in from Belobug's fork, `VICTORY_AMBIENT=2`, lights rooms close to the console's look at no cost in frame rate |
 | The boat | the cause of the sinking is found (see Findings); the fix (`VICTORY_TEXTURE_BACK=1`) is in, not yet checked in game |
 | Async compute | `VICTORY_ASYNC_COMPUTE=1` runs the title's compute queue on the card's compute engine: 5.3 to 5.6 fps against 4.5 in the prison cell (185 against 220 ms a frame), debug layer clean |
+| Lock and copy switches | `VICTORY_HEAP_LOCKS=1` with `VICTORY_COPY_PLAIN=1` and `VICTORY_FILLS_PLAIN=1`: 164.6 against about 174 ms a frame in the prison cell (6.1 fps). Tested and slower or no gain: `VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`, `VICTORY_WINDOW_KB=1024`, `VICTORY_HEAP_SYNC_CUT` |
 | Faces, some foliage and bridges | sometimes without their texture: the 12 GB card runs out of texture room |
 | Stability | runs of 5 to 30 minutes end normally; no device loss in the latest runs |
 
@@ -54,6 +55,9 @@ $env:VICTORY_FSR_DLL = '<path>\amd_fidelityfx_upscaler_dx12.dll'
 $env:VICTORY_AMBIENT = '2'          # stand-in indirect light: rooms lit
 $env:VICTORY_QUEUE2 = '3'           # copy-back and uploads on the copy engine
 $env:VICTORY_ASYNC_COMPUTE = '1'    # the title's compute queue on the card's compute engine
+$env:VICTORY_HEAP_LOCKS = '1'       # heap slots already made are found without the slots' lock
+$env:VICTORY_COPY_PLAIN = '1'       # plain copies of title memory
+$env:VICTORY_FILLS_PLAIN = '1'      # plain fills
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
