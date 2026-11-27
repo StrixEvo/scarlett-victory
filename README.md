@@ -28,7 +28,7 @@ Every result here comes from one PC:
 | RAM | 32 GB |
 | Console profile | Xbox Series X, with the Series S render path (`VICTORY_RENDER_S=1`, below) |
 
-## Status (2026-11-26)
+## Status (2026-11-27)
 
 **Not playable yet**, but the opening plays through to the prison at up to
 about 6 fps.
@@ -40,6 +40,7 @@ about 6 fps.
 | The prison (first walk-around) | **3.8 to 5.7 fps** with the Series S render path and the AMD FSR DLL (run38); 3.2 to 3.6 fps at 4K (run32) |
 | Indoor light | the ray-traced indirect light does not run (`VICTORY_BVH_BUILDER=1` crashes the title: it reads structure sizes before they land). A stand-in from Belobug's fork, `VICTORY_AMBIENT=2`, lights rooms close to the console's look at no cost in frame rate |
 | The boat | the cause of the sinking is found (see Findings); the fix (`VICTORY_TEXTURE_BACK=1`) is in, not yet checked in game |
+| Async compute | `VICTORY_ASYNC_COMPUTE=1` runs the title's compute queue on the card's compute engine: 5.3 to 5.6 fps against 4.5 in the prison cell (185 against 220 ms a frame), debug layer clean |
 | Faces, some foliage and bridges | sometimes without their texture: the 12 GB card runs out of texture room |
 | Stability | runs of 5 to 30 minutes end normally; no device loss in the latest runs |
 
@@ -52,6 +53,7 @@ $env:VICTORY_RENDER_S = '1'          # Series S render path: 3D at 1080p
 $env:VICTORY_FSR_DLL = '<path>\amd_fidelityfx_upscaler_dx12.dll'
 $env:VICTORY_AMBIENT = '2'          # stand-in indirect light: rooms lit
 $env:VICTORY_QUEUE2 = '3'           # copy-back and uploads on the copy engine
+$env:VICTORY_ASYNC_COMPUTE = '1'    # the title's compute queue on the card's compute engine
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
@@ -67,6 +69,7 @@ stays black at the start screen and is not needed.
 
 | Commit | Change |
 |--------|--------|
+| `29575cd` | **Async compute** (`VICTORY_ASYNC_COMPUTE=1`): the title's compute submissions run on a host D3D12 COMPUTE queue, synchronised with fences on the card. About 20 % more frames; the submitting thread waits for the card 22 ms a frame instead of 67. `=2` (no wait before direct lists) gains nothing. |
 | `036b70b` | **Stand-in indirect light** (`VICTORY_AMBIENT`, from Belobug's AMD fork): rooms the sun does not reach are lit from an estimate of the frame's own light. |
 | `62ab248` | **Series S render path on a Series X profile** (`VICTORY_RENDER_S=1`, from Neptune): the title reads a Series S's device type and renders a 1920x1080 game plane under a 3840x2160 UI plane; present now draws the second plane over the first. 3.8 to 5.7 fps against 3.2 to 3.6 at 4K. |
 | `e726e53` | **The Series S upscaler through a PC FidelityFX DLL** (`VICTORY_FSR_DLL`, from Neptune): the title's FidelityFX calls go to AMD's PC DLL with the host device, list and textures. |
