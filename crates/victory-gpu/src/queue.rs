@@ -383,6 +383,12 @@ fn submit_split(this: This, lists: &[This]) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&now);
+        // They have run: their descriptor tables' slots are free again, as
+        // in `submit_cut` (which does this after the same call, for the
+        // same reason: the lists are not detached here, so nothing else
+        // gives their fresh tables' dynamic slots back before the title
+        // resets them).
+        crate::list::tables_done(&lists[..cut]);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -607,18 +613,18 @@ fn join_parts() -> bool {
     }
 }
 
-/// The most parts joined into one host submission (`VICTORY_JOIN_MOST`, 4).
+/// The most parts joined into one host submission (`VICTORY_JOIN_MOST`, 16).
 #[cfg(windows)]
 fn join_most() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_JOIN_MOST").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(4))
+    *N.get_or_init(|| std::env::var("VICTORY_JOIN_MOST").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(16))
 }
 
-/// The most host lists joined into one host submission (`VICTORY_JOIN_LISTS`, 48).
+/// The most host lists joined into one host submission (`VICTORY_JOIN_LISTS`, 128).
 #[cfg(windows)]
 fn join_lists() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_JOIN_LISTS").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(48))
+    *N.get_or_init(|| std::env::var("VICTORY_JOIN_LISTS").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(128))
 }
 
 /// With [`join_parts`]: parts taken off the queues' lines and not yet
@@ -1284,6 +1290,10 @@ pub(crate) enum Written {
     GpuTimestamp,
     /// The CPU's performance counter.
     SystemTimestamp,
+    /// A query result the host GPU resolved into a read-back buffer
+    /// (`crate::query::resolve`, `VICTORY_OCCLUSION`): read when written,
+    /// which is once the list has run.
+    Query(u32),
 }
 
 impl Written {
@@ -1297,6 +1307,7 @@ impl Written {
                 (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
             }
             Written::SystemTimestamp => system_timestamp(),
+            Written::Query(slot) => crate::query::result(slot),
         };
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
@@ -1568,6 +1579,8 @@ extern "system" fn copy_page_mappings(
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
+    // The remapping meter: what the title asks for, by kind of range.
+    crate::framelog::add(crate::framelog::T::PageMapCalls, 1);
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -1579,6 +1592,19 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
+            {
+                use crate::framelog::{T, add};
+                let counted = match r.kind {
+                    0 => Some((T::PageMapRanges0, T::PageMapPages0)),
+                    1 => Some((T::PageMapRanges1, T::PageMapPages1)),
+                    2 => Some((T::PageMapRanges2, T::PageMapPages2)),
+                    _ => None,
+                };
+                if let Some((ranges, pages)) = counted {
+                    add(ranges, 1);
+                    add(pages, u64::from(r.count));
+                }
+            }
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
                 1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),

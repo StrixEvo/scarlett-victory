@@ -803,6 +803,11 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        // What the dispatches before it wrote is seen from here on: a
+        // segment that outlived them ends (`crate::indirect::segments_across`).
+        if count > 0 && crate::indirect::segments_across() {
+            list.segments_end();
+        }
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
@@ -877,6 +882,9 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        // Where shaders wrote the source (`VICTORY_CARD_FILLS`): on the card,
+        // in order (`crate::host::HostList::card_copy`).
+        && !list.card_copy(to as usize, from as usize, len as usize)
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -910,6 +918,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
+        // A copy on the card may write a buffer: no indirect draw after it joins a window before it.
+        crate::indirect::end_window(list);
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -1008,6 +1018,9 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        // A copy on the card (textures, or texels read back into a buffer of ours): no indirect draw after it joins
+        // a window before it (conservative: none of these writes an argument buffer).
+        crate::indirect::end_window(list);
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
@@ -1408,7 +1421,9 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
-        list.defer(move || {
+        // Its place is known: `VICTORY_NEAR_WRITES` uses it (without the
+        // switch the step is the same as `defer`'s).
+        list.defer_at(dst as usize, len, move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
@@ -1426,21 +1441,40 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with the console's
+/// `COMPUTE_DISPATCH_INITIATOR` flags. Bit 5 (0x20,
+/// `USE_THREAD_DIMENSIONS`): `x`, `y`, `z` count threads, not groups (the
+/// ray-tracing structure builder's box stages; fork pull request #646).
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    state::dispatch_x(this, x, y, z, flags);
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch(this);
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery(heap, type, index)`: counted; an occlusion query runs on the host GPU with `VICTORY_OCCLUSION`.
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    crate::query::counted(kind);
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::query::begin(list, heap, kind, index);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, index);
+}
+
+/// `EndQuery(heap, type, index)`: ends what [`begin_query`] began on the host.
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::query::end(list, heap, kind, index);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
 /// each query's result into the buffer once the list has run. Timestamps
@@ -1451,9 +1485,9 @@ extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
 /// not measured ones (time spans come out as the submission's length).
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
@@ -1475,6 +1509,17 @@ extern "system" fn resolve_queries(
     if offset + u64::from(count) * bytes > size {
         return;
     }
+    // With `VICTORY_OCCLUSION`: occlusion results from the host GPU, if every query of the range ran there.
+    #[cfg(windows)]
+    if (kind == OCCLUSION || kind == BINARY)
+        && let Some(list) = host_list(this)
+        // SAFETY: inside the buffer, checked above.
+        && crate::query::resolve(list, heap, kind, first, count, unsafe { data.add(offset as usize) } as u64)
+    {
+        return;
+    }
+    #[cfg(not(windows))]
+    let _ = (heap, first);
     for i in 0..u64::from(count) {
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
@@ -1693,6 +1738,10 @@ mod state {
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch(this);
         with_state(this, |list, s| s.dispatch(list, x, y, z));
+    }
+    pub(super) fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+        super::count_dispatch(this);
+        with_state(this, |list, s| s.dispatch_x(list, x, y, z, flags));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -2238,8 +2287,8 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, begin_query as *const ()),            // 0xe0 BeginQuery
+    (29, end_query as *const ()),              // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
@@ -2343,5 +2392,68 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// A back-copied texture written, whose memory the title then reuses
+    /// (its ticket goes stale), and written again in the same list: the
+    /// second write re-registers the read-back. The old dedup stopped at the
+    /// stale entry and dropped it, a missed read-back (the title's ocean
+    /// height map read back nothing).
+    #[cfg(windows)]
+    #[test]
+    fn a_rewritten_back_texture_after_reuse_is_read_back() {
+        use crate::object::guid;
+        use crate::resource::{create_committed, readback_test_descriptions};
+        let Some(_) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // Make 256x256 R32_FLOAT a back-copied kind, deterministically,
+        // independent of the environment.
+        let _test_kinds = ResetTestKinds(crate::texback::TEST_KINDS.replace(Some(&[(256, 256, 41)])));
+        struct ResetTestKinds(Option<&'static [(u64, u32, u32)]>);
+        impl Drop for ResetTestKinds {
+            fn drop(&mut self) {
+                crate::texback::TEST_KINDS.set(self.0);
+            }
+        }
+        let null = std::ptr::null();
+        let (heap, desc) = readback_test_descriptions();
+        let resource = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut tex = null;
+        assert_eq!(
+            create_committed(null, &heap, 0, &desc, 0, null.cast(), &resource, &mut tex),
+            S_OK
+        );
+        let (_, at, _) = crate::resource::title_texture(tex).expect("synthetic title texture");
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let new_list = || {
+            let mut allocator = null;
+            assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+            let mut list = null;
+            assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+            (list, allocator)
+        };
+        let (list, allocator) = new_list();
+        let host = host_list(list).expect("a host list");
+        host.texture_written(tex);
+        assert!(host.back_wanted_fresh(tex), "the write registered a read-back");
+        // The title reuses the texture's memory: the ticket goes stale.
+        crate::texback::replaced(at);
+        assert!(!host.back_wanted_fresh(tex), "the reuse invalidated the read-back");
+        // Written again in the same list: the read-back is re-registered, not
+        // dropped (the old dedup saw an entry for this texture and stopped).
+        host.texture_written(tex);
+        assert!(host.back_wanted_fresh(tex), "the second write re-registered the read-back");
+        host.close();
+        assert_eq!(host.texture_back_count(), 1, "the rewritten texture was read back");
+        eprintln!("texture ticket regression exercised on host device");
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(tex), 0);
     }
 }
