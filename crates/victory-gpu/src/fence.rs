@@ -119,10 +119,14 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
+/// A fence only moves on: a signal that lands behind a later one (a signal
+/// the title made straight away, then one the queue had held) leaves the
+/// value where the later one put it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    fence.value.store(value, Ordering::Release);
+    fence.value.fetch_max(value, Ordering::AcqRel);
+    let value = fence.value.load(Ordering::Acquire);
     #[cfg(all(windows, feature = "diagnostics"))]
     pace::reached(this, &fence.asked, value);
     waiters.retain(|&(wanted, event)| {
@@ -351,6 +355,40 @@ mod tests {
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
         assert_eq!(unsafe { *(at as *const u64) }, 5);
+        // SAFETY: ours.
+        unsafe { CloseHandle(event) };
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_signal_behind_a_later_one_does_not_move_the_fence_back() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        // SAFETY: plain auto-reset event.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        assert!(!event.is_null());
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        let signal = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+        let at = slot::<extern "system" fn(This) -> u64>(f, 0x60);
+        let value = |f: This| {
+            // SAFETY: the fence's value.
+            unsafe { *(at(f) as *const u64) }
+        };
+        assert_eq!(wait(f, 3, event), S_OK);
+        // The later signal lands first, the held earlier one after it.
+        assert_eq!(signal(f, 5), S_OK);
+        assert_eq!(signal(f, 4), S_OK);
+        assert_eq!(value(f), 5, "a fence does not go back");
+        assert_eq!(signal(f, 2), S_OK);
+        assert_eq!(value(f), 5);
+        // The waiter for 3 was set by the signal that reached 5.
+        // SAFETY: a valid event.
+        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        assert_eq!(completed(f), 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
